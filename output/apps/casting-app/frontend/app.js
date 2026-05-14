@@ -3,8 +3,8 @@ const internalTreeSequenceLimit = 150;
 const metalKtOptions = ["", "14KT", "10KT", "9KT", "18KT", "22KT", "Silver", "Plat"];
 const colorOptions = ["", "White", "Yellow", "Pink"];
 const fixedWhiteMetals = new Set(["Silver", "Plat"]);
-const storageKey = "production-management-state-v1";
-const kanbanStorageKey = "production-management-kanban-v1";
+// storageKey and kanbanStorageKey removed — data lives in PostgreSQL via API
+const _API_WAX_LOADED = false; // flag set after initial API load
 const kanbanWorkflowChangedEvent = "productionKanbanWorkflowChanged";
 const waxEntriesChangedEvent = "waxEntriesChanged";
 const RBAC = window.ProductionRBAC;
@@ -274,20 +274,26 @@ function getDefaultModuleId() {
 }
 
 function loadState() {
-  try {
-    const storedState = JSON.parse(localStorage.getItem(storageKey));
-    if (storedState && Array.isArray(storedState.entries)) {
-      const entries = storedState.entries.map(normalizeEntry).filter(hasEntryData);
-      return {
-        entries,
-        internalTreeSequences: normalizeInternalTreeSequences(storedState.internalTreeSequences, entries)
-      };
-    }
-  } catch {
-    localStorage.removeItem(storageKey);
-  }
-
+  // Returns empty state synchronously; API load happens after auth in loadWaxEntriesFromAPI()
   return createInitialState();
+}
+
+async function loadWaxEntriesFromAPI() {
+  if (!window.CastingAPI) return;
+  try {
+    saveStatus.textContent = "Loading...";
+    const entries = await window.CastingAPI.waxEntries.list();
+    if (Array.isArray(entries)) {
+      state.entries = entries.map(normalizeEntry).filter(hasEntryData);
+      state.internalTreeSequences = normalizeInternalTreeSequences({}, state.entries);
+    }
+    render();
+    emitWaxEntriesChanged();
+    saveStatus.textContent = "Loaded";
+  } catch (err) {
+    saveStatus.textContent = "Failed to load entries";
+    console.error("[app] loadWaxEntriesFromAPI:", err.message);
+  }
 }
 
 function normalizeEntry(entry) {
@@ -662,14 +668,22 @@ function renderCode128Svg(value, className = "barcode-svg", height = 48) {
   `;
 }
 
+// scheduleSave is now a no-op display helper; actual persistence is done inline
+// per-operation via the API (see persistEntry*, persistRush*)
 function scheduleSave(message = "Saved") {
-  saveStatus.textContent = "Saving...";
-  window.clearTimeout(saveTimer);
-  saveTimer = window.setTimeout(() => {
-    localStorage.setItem(storageKey, JSON.stringify(state));
-    emitWaxEntriesChanged();
-    saveStatus.textContent = message;
-  }, 180);
+  emitWaxEntriesChanged();
+  if (saveStatus) saveStatus.textContent = message;
+}
+
+async function _apiPersist(op, onSuccess, onError) {
+  try {
+    const result = await op();
+    if (onSuccess) onSuccess(result);
+  } catch (err) {
+    if (saveStatus) saveStatus.textContent = err.message || "Save failed";
+    if (onError) onError(err);
+    console.error("[app] API persist error:", err.message);
+  }
 }
 
 function emitWaxEntriesChanged() {
@@ -737,7 +751,7 @@ function LoginPage(message = "") {
         </label>
         <p class="form-message" data-login-message aria-live="polite">${escapeHtml(message)}</p>
         <button class="button" type="submit">Login</button>
-        <p class="login-note">Development default admin is available. Change it before production.</p>
+        <p class="login-note" style="display:none"></p>
       </form>
     </div>
   `;
@@ -924,17 +938,11 @@ function matchesFilters(entry, filters) {
   });
 }
 
+// readKanbanWorkflowState — returns in-memory state shared by kanban.js
 function readKanbanWorkflowState() {
-  try {
-    const storedState = JSON.parse(localStorage.getItem(kanbanStorageKey));
-    if (storedState && storedState.orders && typeof storedState.orders === "object") {
-      return storedState.orders;
-    }
-  } catch {
-    return {};
-  }
-
-  return {};
+  return (window._castingKanbanWorkflow && typeof window._castingKanbanWorkflow === "object")
+    ? window._castingKanbanWorkflow
+    : {};
 }
 
 function isEntryInventoryPosted(entryId) {
@@ -1188,6 +1196,10 @@ function setRoleStatus(message) {
 }
 
 function renderMetalReceiving() {
+  renderMetalReceivingAsync();
+}
+
+async function renderMetalReceivingAsync() {
   if (!metalReceivingRoot) return;
 
   if (!Inventory) {
@@ -1202,8 +1214,9 @@ function renderMetalReceiving() {
     return;
   }
 
+  metalReceivingRoot.innerHTML = '<section class="inventory-panel"><p class="role-status">Loading...</p></section>';
   const canCreateReceiving = canUseModule("metalReceiving", "create");
-  const receivingEntries = Inventory.getReceivingEntries();
+  const receivingEntries = await Inventory.getReceivingEntries();
 
   metalReceivingRoot.innerHTML = `
     <section class="inventory-panel">
@@ -1304,6 +1317,10 @@ function renderMetalReceiving() {
 }
 
 function renderInventory() {
+  renderInventoryAsync();
+}
+
+async function renderInventoryAsync() {
   if (!inventoryRoot) return;
 
   if (!Inventory) {
@@ -1680,10 +1697,29 @@ function refreshReceivingColorField(form) {
 }
 
 function UserManagement() {
-  renderUserManagement();
+  renderUserManagementAsync();
 }
 
-function renderUserManagement() {
+async function renderUserManagementAsync() {
+  if (!userManagementRoot) return;
+  if (!RBAC?.getUsers) {
+    userManagementRoot.innerHTML = '<section class="user-panel"><p class="role-status">User management is not available.</p></section>';
+    return;
+  }
+  if (!canManageUsers()) {
+    userManagementRoot.innerHTML =
+      '<section class="user-panel"><p class="role-status">You do not have permission to perform this action.</p></section>';
+    return;
+  }
+  // Show loading while fetching from API
+  userManagementRoot.innerHTML = '<section class="user-panel"><p class="role-status">Loading users...</p></section>';
+  const [usersArr, rolesArr] = await Promise.all([RBAC.getUsers(), Promise.resolve(RBAC.getRoles() || [])]);
+  renderUserManagement(usersArr, rolesArr);
+}
+
+function renderUserManagement(users, roles) {
+  users = users || [];
+  roles = roles || [];
   if (!userManagementRoot) return;
 
   if (!RBAC?.getUsers) {
@@ -1696,9 +1732,6 @@ function renderUserManagement() {
       '<section class="user-panel"><p class="role-status">You do not have permission to perform this action.</p></section>';
     return;
   }
-
-  const users = RBAC.getUsers();
-  const roles = RBAC.getRoles();
   const selectedUser =
     selectedUserId === null ? null : users.find((user) => user.id === selectedUserId) || users[0] || null;
 
@@ -1816,7 +1849,7 @@ function RoleAssignment(roles, assignedRoleIds, isDisabled = false) {
 async function saveUserFromForm() {
   if (!userManagementRoot || !canManageUsers()) return;
 
-  const previousUser = selectedUserId ? RBAC.getUser(selectedUserId) : null;
+  const previousUser = selectedUserId ? (await RBAC.getUser(selectedUserId)) : null;
   const roleIds = canAssignRoles()
     ? Array.from(userManagementRoot.querySelectorAll("[data-user-role]:checked")).map((input) => input.value)
     : previousUser?.assignedRoleIds || [];
@@ -1940,6 +1973,10 @@ function sameArray(left, right) {
 }
 
 function renderAuditLogs() {
+  renderAuditLogsAsync();
+}
+
+async function renderAuditLogsAsync() {
   if (!auditLogsRoot) return;
 
   if (!RBAC) {
@@ -1952,6 +1989,9 @@ function renderAuditLogs() {
       '<section class="audit-panel"><p class="role-status">You do not have permission to perform this action.</p></section>';
     return;
   }
+
+  // Load from API before rendering
+  await loadAuditLogsFromAPI();
 
   const filteredLogs = getFilteredAuditLogs();
   const canExportLogs = canExportAuditLogs();
@@ -2045,8 +2085,21 @@ function renderAuditFilter(field, label, placeholder) {
   `;
 }
 
+// _cachedAuditLogs populated by renderAuditLogsAsync
+let _cachedAuditLogs = [];
+
+async function loadAuditLogsFromAPI() {
+  if (!RBAC?.getAuditLogs) return;
+  try {
+    const logs = await RBAC.getAuditLogs();
+    _cachedAuditLogs = Array.isArray(logs) ? logs : [];
+  } catch {
+    _cachedAuditLogs = [];
+  }
+}
+
 function getFilteredAuditLogs() {
-  const logs = RBAC ? RBAC.getAuditLogs() : [];
+  const logs = _cachedAuditLogs;
   const dateFrom = auditFilters.dateFrom ? new Date(`${auditFilters.dateFrom}T00:00:00`).getTime() : null;
   const dateTo = auditFilters.dateTo ? new Date(`${auditFilters.dateTo}T23:59:59`).getTime() : null;
 
@@ -2395,11 +2448,47 @@ async function submitEntry() {
     return;
   }
 
+  saveStatus.textContent = "Saving...";
+
+  // Optimistic update: show in UI immediately
   state.entries.unshift(savedEntry);
   editingEntryId = null;
   clearEntryForm();
   render();
-  scheduleSave(`Submitted ${savedEntry.barcodeValue}`);
+  emitWaxEntriesChanged();
+  saveStatus.textContent = `Submitted ${savedEntry.barcodeValue}`;
+
+  // Persist to backend
+  if (window.CastingAPI) {
+    try {
+      const apiEntry = await window.CastingAPI.waxEntries.create({
+        vendorCustomerName: savedEntry.vendorCustomerName,
+        date: savedEntry.date,
+        waxInvoiceNo: savedEntry.waxInvoiceNo,
+        waxWeight: savedEntry.waxWeight ? String(savedEntry.waxWeight) : "",
+        customerVendorTreeNo: savedEntry.customerVendorTreeNo,
+        metalKt: savedEntry.metalKt,
+        color: savedEntry.color,
+        isInHouseProduction: Boolean(savedEntry.isInHouseProduction),
+        isRush: Boolean(savedEntry.isRush),
+      });
+      // Replace optimistic entry with server-assigned id / internalTreeNumber
+      if (apiEntry && apiEntry.id) {
+        state.entries = state.entries.map((e) =>
+          e.id === savedEntry.id ? normalizeEntry({ ...savedEntry, ...apiEntry }) : e
+        );
+        render();
+        emitWaxEntriesChanged();
+      }
+    } catch (err) {
+      // Roll back optimistic entry
+      state.entries = state.entries.filter((e) => e.id !== savedEntry.id);
+      render();
+      saveStatus.textContent = err.message || "Failed to submit entry";
+      return;
+    }
+  }
+
   recordAudit("Internal Tree Number Generated", {
     barcodeValue: savedEntry.barcodeValue,
     isInHouseProduction: savedEntry.isInHouseProduction,
@@ -2448,7 +2537,24 @@ function deleteRow(entryId) {
     editingEntryId = null;
   }
   render();
-  scheduleSave("Deleted");
+  saveStatus.textContent = "Deleting...";
+
+  if (window.CastingAPI && deletedEntry && deletedEntry.id) {
+    try {
+      await window.CastingAPI.waxEntries.delete(deletedEntry.id);
+      saveStatus.textContent = "Deleted";
+    } catch (err) {
+      // Roll back
+      state.entries.unshift(deletedEntry);
+      render();
+      saveStatus.textContent = err.message || "Delete failed";
+      return;
+    }
+  } else {
+    saveStatus.textContent = "Deleted";
+  }
+
+  emitWaxEntriesChanged();
   if (deletedEntry) {
     recordAudit("Wax Entry deleted", {
       barcodeValue: getBarcodeValue(deletedEntry),
@@ -2477,7 +2583,21 @@ function toggleRush(entryId) {
   const isRush = !targetEntry.isRush;
   state.entries = state.entries.map((entry) => (entry.id === entryId ? { ...entry, isRush } : entry));
   render();
-  scheduleSave(isRush ? "Rush enabled" : "Rush removed");
+  saveStatus.textContent = isRush ? "Rush enabled" : "Rush removed";
+
+  if (window.CastingAPI) {
+    try {
+      await window.CastingAPI.waxEntries.update(entryId, { isRush });
+    } catch (err) {
+      // Roll back
+      state.entries = state.entries.map((entry) => (entry.id === entryId ? { ...entry, isRush: !isRush } : entry));
+      render();
+      saveStatus.textContent = err.message || "Failed to update rush status";
+      return;
+    }
+  }
+
+  emitWaxEntriesChanged();
   recordAudit(isRush ? "Rush marked" : "Rush removed", {
     barcodeValue: getBarcodeValue(targetEntry),
     isInHouseProduction: Boolean(targetEntry.isInHouseProduction),
@@ -2571,7 +2691,31 @@ function saveEditedRow(entryId, row) {
   state.entries[entryIndex] = updatedEntry;
   editingEntryId = null;
   render();
-  scheduleSave("Updated");
+  saveStatus.textContent = "Saving...";
+
+  if (window.CastingAPI) {
+    try {
+      await window.CastingAPI.waxEntries.update(entryId, {
+        vendorCustomerName: updatedEntry.vendorCustomerName,
+        date: updatedEntry.date,
+        waxInvoiceNo: updatedEntry.waxInvoiceNo,
+        waxWeight: updatedEntry.waxWeight ? String(updatedEntry.waxWeight) : "",
+        customerVendorTreeNo: updatedEntry.customerVendorTreeNo,
+        metalKt: updatedEntry.metalKt,
+        color: updatedEntry.color,
+      });
+      saveStatus.textContent = "Updated";
+    } catch (err) {
+      state.entries[entryIndex] = previousEntry;
+      render();
+      saveStatus.textContent = err.message || "Update failed";
+      return;
+    }
+  } else {
+    saveStatus.textContent = "Updated";
+  }
+
+  emitWaxEntriesChanged();
   recordAudit("Wax Entry edited", {
     barcodeValue: getBarcodeValue(updatedEntry),
     isInHouseProduction: Boolean(updatedEntry.isInHouseProduction),

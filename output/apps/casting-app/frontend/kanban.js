@@ -105,10 +105,15 @@
   }
 
   function readEntryFeed() {
+    // Sync stub — returns empty; async fetchEntryFeedFromAPI() used for real data
+    return normalizeEntryFeed([]);
+  }
+
+  async function fetchEntryFeedFromAPI() {
+    if (!window.CastingAPI) return normalizeEntryFeed([]);
     try {
-      const storedState = JSON.parse(localStorage.getItem(waxStorageKey));
-      const storedEntries = storedState && Array.isArray(storedState.entries) ? storedState.entries : [];
-      return normalizeEntryFeed(storedEntries);
+      const entries = await window.CastingAPI.waxEntries.list();
+      return normalizeEntryFeed(Array.isArray(entries) ? entries : []);
     } catch {
       return normalizeEntryFeed([]);
     }
@@ -160,24 +165,46 @@
   }
 
   function readWorkflowState() {
-    try {
-      const storedState = JSON.parse(localStorage.getItem(kanbanStorageKey));
-      if (storedState && storedState.orders && typeof storedState.orders === "object") {
-        return storedState.orders;
-      }
-    } catch {
-      localStorage.removeItem(kanbanStorageKey);
-    }
-
-    return {};
+    // Sync stub — async fetchWorkflowStateFromAPI() populates state
+    return typeof window._castingKanbanWorkflow === "object" ? window._castingKanbanWorkflow : {};
   }
 
-  function persistWorkflowState(workflowById) {
-    localStorage.setItem(
-      kanbanStorageKey,
-      JSON.stringify({
-        orders: workflowById
-      })
+  async function fetchWorkflowStateFromAPI() {
+    if (!window.CastingAPI) return {};
+    try {
+      const workflows = await window.CastingAPI.castingWorkflow.list();
+      if (!Array.isArray(workflows)) return {};
+      const byId = {};
+      for (const wf of workflows) {
+        // keyed by waxEntryId for compatibility with existing buildOrder logic
+        byId[wf.waxEntryId] = wf;
+      }
+      window._castingKanbanWorkflow = byId;
+      return byId;
+    } catch {
+      return {};
+    }
+  }
+
+  async function persistWorkflowState(waxEntryId, workflowData) {
+    if (!window.CastingAPI || !waxEntryId) return;
+    try {
+      await window.CastingAPI.castingWorkflow.updateByWaxEntry(waxEntryId, workflowData);
+      // Update shared in-memory cache so app.js isEntryInventoryPosted() stays accurate
+      if (!window._castingKanbanWorkflow) window._castingKanbanWorkflow = {};
+      window._castingKanbanWorkflow[waxEntryId] = workflowData;
+    } catch (err) {
+      console.error("[kanban] persistWorkflowState:", err.message);
+    }
+  }
+
+  // Legacy shim kept for any remaining call sites
+  function _persistWorkflowStateAll(workflowById) {
+    window._castingKanbanWorkflow = workflowById || {};
+    // Persist each changed entry (fire-and-forget)
+    Object.entries(workflowById || {}).forEach(([id, data]) => {
+      if (window.CastingAPI) persistWorkflowState(id, data).catch(() => {});
+    }
     );
     window.dispatchEvent(new CustomEvent(kanbanWorkflowChangedEvent, { detail: { orders: workflowById } }));
   }
@@ -789,8 +816,9 @@
   }
 
   function KanbanBoard() {
-    const [entryFeed, setEntryFeed] = useState(readEntryFeed);
-    const [workflowById, setWorkflowById] = useState(readWorkflowState);
+    const [entryFeed, setEntryFeed] = useState(() => normalizeEntryFeed([]));
+    const [workflowById, setWorkflowById] = useState(() => ({}));
+    const [isLoading, setIsLoading] = useState(true);
     const [selectedOrderId, setSelectedOrderId] = useState(null);
     const [draftNotes, setDraftNotes] = useState("");
     const [error, setError] = useState("");
@@ -834,34 +862,40 @@
     const hasWaxEntries = entryFeed.entries.length > 0;
 
     useEffect(() => {
-      function syncFromStorage() {
-        setEntryFeed(readEntryFeed());
+      async function loadFromAPI() {
+        setIsLoading(true);
+        try {
+          const [feed, workflows] = await Promise.all([
+            fetchEntryFeedFromAPI(),
+            fetchWorkflowStateFromAPI()
+          ]);
+          setEntryFeed(feed);
+          setWorkflowById(workflows);
+        } finally {
+          setIsLoading(false);
+        }
       }
 
+      loadFromAPI();
+
+      // Re-load when wax entries change (e.g. after create in app.js tab)
       function handleWaxEntriesChanged(event) {
-        const entries =
-          event.detail && Array.isArray(event.detail.entries) ? event.detail.entries : readEntryFeed().entries;
-        setEntryFeed(normalizeEntryFeed(entries));
-      }
-
-      function handleStorage(event) {
-        if (event.key === waxStorageKey) {
-          syncFromStorage();
+        if (event.detail && Array.isArray(event.detail.entries)) {
+          setEntryFeed(normalizeEntryFeed(event.detail.entries));
+        } else {
+          fetchEntryFeedFromAPI().then(setEntryFeed);
         }
-
-        if (event.key === kanbanStorageKey) {
-          setWorkflowById(readWorkflowState());
-        }
+        fetchWorkflowStateFromAPI().then(setWorkflowById);
       }
 
       window.addEventListener(waxEntriesChangedEvent, handleWaxEntriesChanged);
-      window.addEventListener("storage", handleStorage);
-      window.addEventListener("focus", syncFromStorage);
+      window.addEventListener("focus", () => {
+        fetchEntryFeedFromAPI().then(setEntryFeed);
+        fetchWorkflowStateFromAPI().then(setWorkflowById);
+      });
 
       return () => {
         window.removeEventListener(waxEntriesChangedEvent, handleWaxEntriesChanged);
-        window.removeEventListener("storage", handleStorage);
-        window.removeEventListener("focus", syncFromStorage);
       };
     }, []);
 
@@ -893,9 +927,7 @@
       };
     }, []);
 
-    useEffect(() => {
-      persistWorkflowState(workflowById);
-    }, [workflowById]);
+    // Workflow is persisted per-operation inside submitOrder via persistWorkflowState(id, data)
 
     useEffect(() => {
       if (
@@ -1152,10 +1184,9 @@
 
       setWorkflowById((currentState) => {
         const existingWorkflow = currentState[selectedOrder.id] || {};
+        const _waxEntryId = selectedOrder.id;
 
-        return {
-          ...currentState,
-          [selectedOrder.id]: {
+        const _nextWorkflow = {
             ...existingWorkflow,
             stage: shouldFinalizeDamagedTree ? selectedOrder.stage : nextStage,
             notes: notesValue.trim(),
@@ -1239,7 +1270,14 @@
                 }
               : {}),
             updatedAt: submittedAt
-          }
+          };
+
+        // Persist the updated workflow to the backend API (fire-and-forget)
+        persistWorkflowState(_waxEntryId, _nextWorkflow);
+
+        return {
+          ...currentState,
+          [_waxEntryId]: _nextWorkflow
         };
       });
 
@@ -1436,6 +1474,12 @@
           stage: nextStageLabel
         });
       }
+    }
+
+    if (isLoading) {
+      return h("div", { className: "kanban-loading", style: { padding: "2rem", textAlign: "center" } },
+        h("p", null, "Loading casting workflow...")
+      );
     }
 
     if (!canViewCastingProcess) {

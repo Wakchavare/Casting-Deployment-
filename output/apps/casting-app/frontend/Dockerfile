@@ -1,15 +1,15 @@
 FROM nginx:1.27-alpine
 
-# Remove default config
-RUN rm /etc/nginx/conf.d/default.conf
+# Remove default nginx config
+RUN rm -f /etc/nginx/conf.d/default.conf
 
-# Copy nginx configuration
+# Copy nginx config
 COPY nginx.conf /etc/nginx/conf.d/default.conf
 
-# Copy static frontend files
+# Copy all frontend static files
 COPY . /usr/share/nginx/html/
 
-# Remove Dockerfile and config from web root
+# Clean up non-web files from web root
 RUN rm -f /usr/share/nginx/html/Dockerfile \
           /usr/share/nginx/html/nginx.conf \
           /usr/share/nginx/html/*.bak

@@ -2,8 +2,7 @@
   "use strict";
 
   const RBAC = window.ProductionRBAC;
-  const receivingStorageKey = "production-management-metal-receiving-v1";
-  const ledgerStorageKey = "production-management-inventory-ledger-v1";
+  // receivingStorageKey + ledgerStorageKey removed — data lives in PostgreSQL via API
   const receivingChangedEvent = "productionMetalReceivingChanged";
   const ledgerChangedEvent = "productionInventoryLedgerChanged";
 
@@ -120,9 +119,8 @@
       createdByUsername: options.user?.username || options.user?.name || ""
     };
 
-    const state = readReceivingState();
-    state.entries.unshift(receivingEntry);
-    writeReceivingState(state);
+    // Persist to API (async; caller must await submitMetalReceiving)
+    await writeReceivingState(receivingEntry);
 
     const ledgerEntry = createInventoryLedgerEntry(
       {
@@ -668,42 +666,76 @@
     };
   }
 
-  function readReceivingState() {
-    const storedState = readJson(receivingStorageKey);
-    return {
-      entries:
-        storedState && Array.isArray(storedState.entries)
-          ? storedState.entries.map(sanitizeReceivingEntry)
-          : []
-    };
+  async function readReceivingState() {
+    if (!window.CastingAPI) return { entries: [] };
+    try {
+      const data = await window.CastingAPI.metalReceiving.list();
+      return { entries: Array.isArray(data) ? data.map(sanitizeReceivingEntry) : [] };
+    } catch { return { entries: [] }; }
   }
 
-  function writeReceivingState(state) {
-    localStorage.setItem(receivingStorageKey, JSON.stringify({ entries: state.entries.map(sanitizeReceivingEntry) }));
-    window.dispatchEvent(new CustomEvent(receivingChangedEvent, { detail: { entries: getReceivingEntries() } }));
+  async function writeReceivingState(entry) {
+    // entry is the new receiving entry to persist
+    if (!window.CastingAPI) return;
+    try {
+      const saved = await window.CastingAPI.metalReceiving.create({
+        receivingDate: entry.submittedAt ? entry.submittedAt.slice(0, 10) : new Date().toISOString().slice(0, 10),
+        vendor: entry.supplier || "",
+        invoiceNo: entry.referenceNumber || "",
+        metalKt: entry.purity || "",
+        color: entry.color || "",
+        metalSource: entry.metalType || "",
+        grossWeight: entry.weightReceived ? String(entry.weightReceived) : "",
+        netWeight: entry.weightReceived ? String(entry.weightReceived) : "",
+        notes: entry.notes || "",
+      });
+      window.dispatchEvent(new CustomEvent(receivingChangedEvent, { detail: { entry: saved } }));
+    } catch (err) {
+      console.error("[inventory] writeReceivingState:", err.message);
+      throw err;
+    }
   }
 
-  function readLedgerState() {
-    const storedState = readJson(ledgerStorageKey);
-    return {
-      entries:
-        storedState && Array.isArray(storedState.entries)
-          ? storedState.entries.map((entry) => ({
-              ...normalizeLedgerEntry(entry, {
-                user: {
-                  id: entry.createdByUserId,
-                  username: entry.createdByUsername
-                }
-              }),
-              balanceAfterTransaction: roundWeight(Number.parseFloat(entry.balanceAfterTransaction) || 0)
+  async function readLedgerState() {
+    if (!window.CastingAPI) return { entries: [] };
+    try {
+      const data = await window.CastingAPI.inventoryLedger.list();
+      return {
+        entries: Array.isArray(data)
+          ? data.map((entry) => ({
+              ...normalizeLedgerEntry(entry, { user: { id: entry.postedByUserId, username: entry.postedByUsername } }),
+              balanceAfterTransaction: roundWeight(Number.parseFloat(entry.finishedWeight || entry.issuedWeight || 0) || 0)
             }))
           : []
-    };
+      };
+    } catch { return { entries: [] }; }
   }
 
-  function writeLedgerState(state) {
-    localStorage.setItem(ledgerStorageKey, JSON.stringify({ entries: state.entries }));
-    window.dispatchEvent(new CustomEvent(ledgerChangedEvent, { detail: { entries: getInventoryLedger() } }));
+  async function writeLedgerState(ledgerEntries) {
+    if (!window.CastingAPI) return [];
+    const results = [];
+    for (const entry of (Array.isArray(ledgerEntries) ? ledgerEntries : [ledgerEntries])) {
+      try {
+        const saved = await window.CastingAPI.inventoryLedger.post({
+          internalTreeNumber: entry.relatedInternalTreeNumber || entry.internalTreeNumber || "",
+          entryType: "final_post",
+          metalKt: entry.purity || "",
+          color: entry.color || "",
+          metalSource: entry.metalType || "",
+          finishedWeight: entry.inWeight ? String(entry.inWeight) : "",
+          spruWeight: "",
+          scrapWeight: entry.outWeight ? String(entry.outWeight) : "",
+          notes: entry.notes || "",
+          rawPayload: entry,
+        });
+        results.push(saved);
+      } catch (err) {
+        console.error("[inventory] writeLedgerState:", err.message);
+        throw err;
+      }
+    }
+    window.dispatchEvent(new CustomEvent(ledgerChangedEvent, { detail: { entries: results } }));
+    return results;
   }
 
   function recordAudit(action, details = {}) {
@@ -716,14 +748,7 @@
     });
   }
 
-  function readJson(key) {
-    try {
-      return JSON.parse(localStorage.getItem(key));
-    } catch {
-      localStorage.removeItem(key);
-      return null;
-    }
-  }
+  // readJson removed — no localStorage production data
 
   function createId(prefix) {
     if (window.crypto && typeof window.crypto.randomUUID === "function") {
