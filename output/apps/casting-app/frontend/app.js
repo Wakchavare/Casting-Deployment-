@@ -3,7 +3,8 @@ const internalTreeSequenceLimit = 150;
 const metalKtOptions = ["", "14KT", "10KT", "9KT", "18KT", "22KT", "Silver", "Plat"];
 const colorOptions = ["", "White", "Yellow", "Pink"];
 const fixedWhiteMetals = new Set(["Silver", "Plat"]);
-// API-backed — no localStorage for business data
+const storageKey = "production-management-state-v1";
+const kanbanStorageKey = "production-management-kanban-v1";
 const kanbanWorkflowChangedEvent = "productionKanbanWorkflowChanged";
 const waxEntriesChangedEvent = "waxEntriesChanged";
 const RBAC = window.ProductionRBAC;
@@ -27,6 +28,7 @@ const exportCsvButton = document.querySelector("#exportCsvButton");
 const rowCount = document.querySelector("#rowCount");
 const saveStatus = document.querySelector("#saveStatus");
 const submitEntryButton = document.querySelector("#submitEntryButton");
+const inHouseProductionInput = document.querySelector("#inHouseProductionInput");
 const clearFiltersButton = document.querySelector("#clearFiltersButton");
 const todayDateButton = document.querySelector("#todayDateButton");
 const copyLastVendorButton = document.querySelector("#copyLastVendorButton");
@@ -82,6 +84,7 @@ let selectedRoleId = "role_admin";
 let selectedUserId = "user_admin";
 let auditFilters = {
   action: "",
+  barcodeValue: "",
   dateFrom: "",
   dateTo: "",
   internalTreeNumber: "",
@@ -90,6 +93,7 @@ let auditFilters = {
   user: ""
 };
 let inventoryFilters = {
+  barcodeValue: "",
   dateFrom: "",
   dateTo: "",
   internalTreeNumber: "",
@@ -109,6 +113,8 @@ function createBlankEntry() {
     metalKt: "",
     color: "",
     internalTreeNumber: "",
+    barcodeValue: "",
+    isInHouseProduction: false,
     isRush: false
   };
 }
@@ -268,29 +274,31 @@ function getDefaultModuleId() {
 }
 
 function loadState() {
-  // Synchronous stub — actual data loaded async via loadStateFromAPI()
-  return createInitialState();
-}
-
-async function loadStateFromAPI() {
   try {
-    const API = window.CastingAPI;
-    if (!API) return createInitialState();
-    const entries = await API.waxEntries.list();
-    const normalizedEntries = entries.map(normalizeEntry).filter(hasEntryData);
-    return { entries: normalizedEntries, internalTreeSequences: {} };
+    const storedState = JSON.parse(localStorage.getItem(storageKey));
+    if (storedState && Array.isArray(storedState.entries)) {
+      const entries = storedState.entries.map(normalizeEntry).filter(hasEntryData);
+      return {
+        entries,
+        internalTreeSequences: normalizeInternalTreeSequences(storedState.internalTreeSequences, entries)
+      };
+    }
   } catch {
-    return createInitialState();
+    localStorage.removeItem(storageKey);
   }
+
+  return createInitialState();
 }
 
 function normalizeEntry(entry) {
   const metalKt = entry.metalKt || "";
   const internalTreeNumber = getInternalTreeNumber(entry);
+  const barcodeValue = getBarcodeValue({ ...entry, internalTreeNumber });
 
   return {
     id: entry.id || createId(),
     internalTreeNumber,
+    barcodeValue,
     vendorCustomerName: entry.vendorCustomerName || "",
     date: entry.date || "",
     waxInvoiceNo: entry.waxInvoiceNo || "",
@@ -298,13 +306,14 @@ function normalizeEntry(entry) {
     customerVendorTreeNo: entry.customerVendorTreeNo || "",
     metalKt,
     color: getColorForMetal(metalKt, entry.color || ""),
+    isInHouseProduction: Boolean(entry.isInHouseProduction),
     isRush: Boolean(entry.isRush)
   };
 }
 
 function hasEntryData(entry) {
   return Object.entries(entry).some(
-    ([key, value]) => key !== "id" && key !== "isRush" && String(value || "").trim()
+    ([key, value]) => !["id", "isRush", "isInHouseProduction"].includes(key) && String(value || "").trim()
   );
 }
 
@@ -438,65 +447,229 @@ function generateInternalTreeNumber() {
   };
 }
 
+function generateUniqueBarcodeFields(entry) {
+  let attempts = 0;
+
+  while (attempts < 1000) {
+    attempts += 1;
+    const generatedTree = generateInternalTreeNumber();
+    const barcodeValue = buildBarcodeValue(entry.date, generatedTree.internalTreeNumber);
+
+    if (barcodeValue && !hasDuplicateBarcodeValue(barcodeValue)) {
+      return {
+        ...generatedTree,
+        barcodeValue
+      };
+    }
+  }
+
+  return null;
+}
+
+function buildBarcodeValue(date, internalTreeNumber) {
+  const dateCode = getBarcodeDate(date);
+  const treeNumber = String(internalTreeNumber || "").trim().toUpperCase();
+  return dateCode && treeNumber ? normalizeBarcodeValue(`${dateCode}-${treeNumber}`) : "";
+}
+
+function getBarcodeValue(entry = {}) {
+  const existingValue = normalizeBarcodeValue(entry.barcodeValue);
+  if (existingValue) return existingValue;
+
+  return buildBarcodeValue(entry.date, getInternalTreeNumber(entry));
+}
+
+function normalizeBarcodeValue(value) {
+  return String(value || "")
+    .trim()
+    .toUpperCase()
+    .replace(/\s+/g, "")
+    .replace(/[^A-Z0-9-]/g, "");
+}
+
+function normalizeBarcodeSearch(value) {
+  return normalizeBarcodeValue(value).replace(/[^A-Z0-9]/g, "");
+}
+
+function hasDuplicateBarcodeValue(barcodeValue, excludedEntryId = "") {
+  const searchValue = normalizeBarcodeSearch(barcodeValue);
+  if (!searchValue) return false;
+
+  return state.entries.some(
+    (entry) => entry.id !== excludedEntryId && normalizeBarcodeSearch(getBarcodeValue(entry)) === searchValue
+  );
+}
+
+const code128Patterns = [
+  "212222",
+  "222122",
+  "222221",
+  "121223",
+  "121322",
+  "131222",
+  "122213",
+  "122312",
+  "132212",
+  "221213",
+  "221312",
+  "231212",
+  "112232",
+  "122132",
+  "122231",
+  "113222",
+  "123122",
+  "123221",
+  "223211",
+  "221132",
+  "221231",
+  "213212",
+  "223112",
+  "312131",
+  "311222",
+  "321122",
+  "321221",
+  "312212",
+  "322112",
+  "322211",
+  "212123",
+  "212321",
+  "232121",
+  "111323",
+  "131123",
+  "131321",
+  "112313",
+  "132113",
+  "132311",
+  "211313",
+  "231113",
+  "231311",
+  "112133",
+  "112331",
+  "132131",
+  "113123",
+  "113321",
+  "133121",
+  "313121",
+  "211331",
+  "231131",
+  "213113",
+  "213311",
+  "213131",
+  "311123",
+  "311321",
+  "331121",
+  "312113",
+  "312311",
+  "332111",
+  "314111",
+  "221411",
+  "431111",
+  "111224",
+  "111422",
+  "121124",
+  "121421",
+  "141122",
+  "141221",
+  "112214",
+  "112412",
+  "122114",
+  "122411",
+  "142112",
+  "142211",
+  "241211",
+  "221114",
+  "413111",
+  "241112",
+  "134111",
+  "111242",
+  "121142",
+  "121241",
+  "114212",
+  "124112",
+  "124211",
+  "411212",
+  "421112",
+  "421211",
+  "212141",
+  "214121",
+  "412121",
+  "111143",
+  "111341",
+  "131141",
+  "114113",
+  "114311",
+  "411113",
+  "411311",
+  "113141",
+  "114131",
+  "311141",
+  "411131",
+  "211412",
+  "211214",
+  "211232",
+  "2331112"
+];
+
+function getCode128BCodePoints(value) {
+  const text = normalizeBarcodeValue(value);
+  if (!text) return [];
+
+  const startCode = 104;
+  const codes = [startCode];
+  let checksum = startCode;
+
+  for (let index = 0; index < text.length; index += 1) {
+    const charCode = text.charCodeAt(index);
+    if (charCode < 32 || charCode > 126) {
+      return [];
+    }
+
+    const codeValue = charCode - 32;
+    codes.push(codeValue);
+    checksum += codeValue * (index + 1);
+  }
+
+  codes.push(checksum % 103, 106);
+  return codes;
+}
+
+function renderCode128Svg(value, className = "barcode-svg", height = 48) {
+  const barcodeValue = normalizeBarcodeValue(value);
+  const codePoints = getCode128BCodePoints(barcodeValue);
+  if (!codePoints.length) return "";
+
+  const quietZone = 10;
+  let x = quietZone;
+  const rects = [];
+
+  codePoints.forEach((codePoint) => {
+    const pattern = code128Patterns[codePoint] || "";
+    Array.from(pattern).forEach((widthValue, index) => {
+      const width = Number(widthValue);
+      if (index % 2 === 0) {
+        rects.push(`<rect x="${x}" y="0" width="${width}" height="${height}"></rect>`);
+      }
+      x += width;
+    });
+  });
+
+  const totalWidth = x + quietZone;
+  return `
+    <svg class="${escapeAttribute(className)}" viewBox="0 0 ${totalWidth} ${height}" preserveAspectRatio="none" role="img" aria-label="Code 128 barcode ${escapeAttribute(barcodeValue)}" xmlns="http://www.w3.org/2000/svg">
+      <rect x="0" y="0" width="${totalWidth}" height="${height}" fill="#ffffff"></rect>
+      <g fill="#000000">${rects.join("")}</g>
+    </svg>
+  `;
+}
+
 function scheduleSave(message = "Saved") {
-  // For wax entries, changes are persisted immediately via API calls (createEntry/updateEntry/deleteEntry)
-  // This function is kept for compatibility; emit the change event
-  emitWaxEntriesChanged();
-  if (typeof saveStatus !== "undefined" && saveStatus) {
+  saveStatus.textContent = "Saving...";
+  window.clearTimeout(saveTimer);
+  saveTimer = window.setTimeout(() => {
+    localStorage.setItem(storageKey, JSON.stringify(state));
+    emitWaxEntriesChanged();
     saveStatus.textContent = message;
-  }
-}
-
-async function persistEntryCreate(entryData) {
-  const API = window.CastingAPI;
-  if (!API) return null;
-  try {
-    const saved = await API.waxEntries.create({
-      vendorCustomerName: entryData.vendorCustomerName || "",
-      date: entryData.date || "",
-      waxInvoiceNo: entryData.waxInvoiceNo || "",
-      customerVendorTreeNo: entryData.customerVendorTreeNo || "",
-      metalKt: entryData.metalKt || "",
-      color: entryData.color || "",
-      waxWeight: entryData.waxWeight ? String(entryData.waxWeight) : "",
-      isRush: Boolean(entryData.isRush),
-    });
-    return saved;
-  } catch (err) {
-    console.error("[app] persistEntryCreate error:", err.message);
-    throw err;
-  }
-}
-
-async function persistEntryUpdate(entryId, entryData) {
-  const API = window.CastingAPI;
-  if (!API) return null;
-  try {
-    return await API.waxEntries.update(entryId, {
-      vendorCustomerName: entryData.vendorCustomerName,
-      date: entryData.date,
-      waxInvoiceNo: entryData.waxInvoiceNo,
-      customerVendorTreeNo: entryData.customerVendorTreeNo,
-      metalKt: entryData.metalKt,
-      color: entryData.color,
-      waxWeight: entryData.waxWeight ? String(entryData.waxWeight) : "",
-      isRush: Boolean(entryData.isRush),
-    });
-  } catch (err) {
-    console.error("[app] persistEntryUpdate error:", err.message);
-    throw err;
-  }
-}
-
-async function persistEntryDelete(entryId) {
-  const API = window.CastingAPI;
-  if (!API) return;
-  try {
-    await API.waxEntries.delete(entryId);
-  } catch (err) {
-    console.error("[app] persistEntryDelete error:", err.message);
-    throw err;
-  }
+  }, 180);
 }
 
 function emitWaxEntriesChanged() {
@@ -667,13 +840,14 @@ function syncActionAccess() {
     field.disabled = fieldName === "internalTreeNumber" || !canCreateWax;
   });
 
-  [todayDateButton, copyLastVendorButton, copyLastInvoiceButton, submitEntryButton].forEach((button) => {
+  [todayDateButton, copyLastVendorButton, copyLastInvoiceButton, submitEntryButton, inHouseProductionInput].forEach((button) => {
     button.disabled = !canCreateWax;
   });
 
   todayDateButton.title = canCreateWax ? "Use today's date" : "Create permission required";
   copyLastVendorButton.title = canCreateWax ? "Copy last vendor/customer name" : "Create permission required";
   copyLastInvoiceButton.title = canCreateWax ? "Copy last wax invoice number" : "Create permission required";
+  inHouseProductionInput.title = canCreateWax ? "Mark as In-House Production" : "Create permission required";
   submitEntryButton.title = canCreateWax ? "Submit entry" : "Create permission required";
 
   exportCsvButton.disabled = !canExportWax;
@@ -745,14 +919,20 @@ function matchesFilters(entry, filters) {
 
     const rawValue = String(entry[field] || "").toLowerCase();
     const displayValue = field === "date" && entry.date ? formatDate(entry.date).toLowerCase() : rawValue;
-    return rawValue.includes(filterValue) || displayValue.includes(filterValue);
+    const barcodeValue = field === "internalTreeNumber" ? getBarcodeValue(entry).toLowerCase() : "";
+    return rawValue.includes(filterValue) || displayValue.includes(filterValue) || barcodeValue.includes(filterValue);
   });
 }
 
-// readKanbanWorkflowState removed — kanban state is API-backed via casting-workflow module
 function readKanbanWorkflowState() {
-  // Returns empty — real data loaded async in kanban.js via fetchWorkflowState()
-  return {};
+  try {
+    const storedState = JSON.parse(localStorage.getItem(kanbanStorageKey));
+    if (storedState && storedState.orders && typeof storedState.orders === "object") {
+      return storedState.orders;
+    }
+  } catch {
+    return {};
+  }
 
   return {};
 }
@@ -1182,6 +1362,7 @@ function renderInventory() {
               ${renderInventoryFilter("metalKtColor", "KT / Color", "Search KT or color")}
               ${renderInventoryFilter("transactionType", "Transaction Type", "Search transaction")}
               ${renderInventoryFilter("internalTreeNumber", "Internal Tree Number", "Search tree")}
+              ${renderInventoryFilter("barcodeValue", "Barcode Value", "Search barcode")}
               <label>
                 <span>From</span>
                 <input type="date" data-inventory-filter="dateFrom" value="${escapeAttribute(inventoryFilters.dateFrom)}">
@@ -1206,6 +1387,7 @@ function renderInventory() {
                     <th>Out Weight</th>
                     <th>Balance After Transaction</th>
                     <th>Internal Tree Number</th>
+                    <th>Barcode Value</th>
                     <th>Order ID</th>
                     <th>Source Module</th>
                     <th>Created By User</th>
@@ -1229,6 +1411,7 @@ function renderInventory() {
                                 <td>${escapeHtml(formatInventoryWeight(entry.outWeight))}</td>
                                 <td>${escapeHtml(formatInventoryWeight(entry.balanceAfterTransaction))}</td>
                                 <td>${escapeHtml(entry.relatedInternalTreeNumber)}</td>
+                                <td>${escapeHtml(entry.relatedBarcodeValue)}</td>
                                 <td>${escapeHtml(entry.relatedOrderId)}</td>
                                 <td>${escapeHtml(entry.sourceModule)}</td>
                                 <td>${escapeHtml(entry.createdByUsername)}</td>
@@ -1237,7 +1420,7 @@ function renderInventory() {
                             `
                           )
                           .join("")
-                      : '<tr><td colspan="14" class="audit-empty">No inventory ledger entries match the current filters.</td></tr>'
+                      : '<tr><td colspan="15" class="audit-empty">No inventory ledger entries match the current filters.</td></tr>'
                   }
                 </tbody>
               </table>
@@ -1272,7 +1455,8 @@ function getFilteredInventoryLedger() {
       matchesAuditFilter(entry.metalType, inventoryFilters.metalType) &&
       matchesAuditFilter(`${entry.metalKtColor} ${entry.purity} ${entry.color}`, inventoryFilters.metalKtColor) &&
       matchesAuditFilter(entry.transactionType, inventoryFilters.transactionType) &&
-      matchesAuditFilter(entry.relatedInternalTreeNumber, inventoryFilters.internalTreeNumber)
+      matchesAuditFilter(entry.relatedInternalTreeNumber, inventoryFilters.internalTreeNumber) &&
+      matchesAuditFilter(entry.relatedBarcodeValue, inventoryFilters.barcodeValue)
     );
   });
 }
@@ -1371,6 +1555,7 @@ function exportInventoryLedgerCsv() {
     "Out Weight",
     "Balance After Transaction",
     "Related Internal Tree Number",
+    "Related Barcode Value",
     "Related Order ID",
     "Source Module",
     "Created By User",
@@ -1387,6 +1572,7 @@ function exportInventoryLedgerCsv() {
     entry.outWeight,
     entry.balanceAfterTransaction,
     entry.relatedInternalTreeNumber,
+    entry.relatedBarcodeValue,
     entry.relatedOrderId,
     entry.sourceModule,
     entry.createdByUsername,
@@ -1789,6 +1975,7 @@ function renderAuditLogs() {
         ${renderAuditFilter("stage", "Stage", "Search stage")}
         ${renderAuditFilter("action", "Action", "Search action")}
         ${renderAuditFilter("internalTreeNumber", "Internal Tree Number", "Search tree")}
+        ${renderAuditFilter("barcodeValue", "Barcode Value", "Search barcode")}
         <label>
           <span>From</span>
           <input type="date" data-audit-filter="dateFrom" value="${escapeAttribute(auditFilters.dateFrom)}">
@@ -1809,6 +1996,8 @@ function renderAuditLogs() {
               <th>Module</th>
               <th>Stage</th>
               <th>Internal Tree Number</th>
+              <th>In-House Production</th>
+              <th>Barcode Value</th>
               <th>Old Value</th>
               <th>New Value</th>
               <th>IP / Device</th>
@@ -1828,6 +2017,8 @@ function renderAuditLogs() {
                           <td>${escapeHtml(log.module)}</td>
                           <td>${escapeHtml(log.stage)}</td>
                           <td>${escapeHtml(log.internalTreeNumber)}</td>
+                          <td>${escapeHtml(log.isInHouseProduction)}</td>
+                          <td>${escapeHtml(log.barcodeValue)}</td>
                           <td>${escapeHtml(log.oldValue)}</td>
                           <td>${escapeHtml(log.newValue)}</td>
                           <td>${escapeHtml(log.device)}</td>
@@ -1836,7 +2027,7 @@ function renderAuditLogs() {
                       `
                     )
                     .join("")
-                : '<tr><td colspan="10" class="audit-empty">No audit logs match the current filters.</td></tr>'
+                : '<tr><td colspan="12" class="audit-empty">No audit logs match the current filters.</td></tr>'
             }
           </tbody>
         </table>
@@ -1869,7 +2060,8 @@ function getFilteredAuditLogs() {
       matchesAuditFilter(log.module, auditFilters.module) &&
       matchesAuditFilter(log.stage, auditFilters.stage) &&
       matchesAuditFilter(log.action, auditFilters.action) &&
-      matchesAuditFilter(log.internalTreeNumber, auditFilters.internalTreeNumber)
+      matchesAuditFilter(log.internalTreeNumber, auditFilters.internalTreeNumber) &&
+      matchesAuditFilter(log.barcodeValue, auditFilters.barcodeValue)
     );
   });
 }
@@ -1894,6 +2086,8 @@ function exportAuditLogsCsv() {
     "Module",
     "Stage",
     "Internal Tree Number",
+    "In-House Production",
+    "Barcode Value",
     "Old Value",
     "New Value",
     "IP / Device",
@@ -1906,6 +2100,8 @@ function exportAuditLogsCsv() {
     log.module,
     log.stage,
     log.internalTreeNumber,
+    log.isInHouseProduction,
+    log.barcodeValue,
     log.oldValue,
     log.newValue,
     log.device,
@@ -2028,6 +2224,8 @@ function getUniqueFieldValues(field) {
 function renderReadonlyRow(entry, index) {
   const isRush = Boolean(entry.isRush);
   const rushBadge = isRush ? '<span class="rush-badge">Rush</span>' : "";
+  const isInHouseProduction = Boolean(entry.isInHouseProduction);
+  const inHouseProductionBadge = isInHouseProduction ? '<span class="in-house-badge">In-House Prod</span>' : "";
   const isInventoryPosted = isEntryInventoryPosted(entry.id);
   const lockedBadge = isInventoryPosted ? '<span class="locked-badge">Inventory Posted</span>' : "";
   const lockedTitle = "Order locked after inventory posting";
@@ -2052,11 +2250,16 @@ function renderReadonlyRow(entry, index) {
     <td class="metal-cell" data-label="Metal KT">${escapeHtml(entry.metalKt)}</td>
     <td class="color-cell" data-label="Color">${escapeHtml(entry.color)}</td>
     <td class="wax-weight-cell" data-label="Wax Weight">${escapeHtml(entry.waxWeight)}</td>
-    <td class="tree-cell" data-label="Internal Tree Number">${escapeHtml(getInternalTreeNumber(entry) || "Pending")}</td>
+    <td class="tree-cell" data-label="Internal Tree Number">
+      <div class="tree-number-with-badge">
+        <span class="tree-number-value">${escapeHtml(getInternalTreeNumber(entry) || "Pending")}</span>
+        ${inHouseProductionBadge}
+      </div>
+    </td>
     <td class="action-cell" data-label="Action">
       <div class="row-actions">
         <button class="rush-button ${isRush ? "is-active" : ""}" type="button" data-rush-row title="${isInventoryPosted ? lockedTitle : canToggleRush ? rushButtonTitle : "Mark rush permission required"}" aria-label="${rushButtonLabel}" aria-pressed="${String(isRush)}" ${canToggleRush ? "" : "disabled"}>Rush</button>
-        <button class="print-button" type="button" data-print-row title="${canPrintWax ? "Print" : "Print permission required"}" aria-label="Print" ${canPrintWax ? "" : "disabled"}>
+        <button class="print-button" type="button" data-print-row title="${canPrintWax ? "Print Barcode" : "Print permission required"}" aria-label="Print Barcode" ${canPrintWax ? "" : "disabled"}>
           <svg class="print-icon" aria-hidden="true" viewBox="0 0 24 24" focusable="false">
             <path d="M6 9V3h12v6"></path>
             <path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"></path>
@@ -2158,6 +2361,7 @@ async function submitEntry() {
     customerVendorTreeNo: formFields.customerVendorTreeNo.value.trim(),
     metalKt,
     color: getColorForMetal(metalKt, formFields.color.value),
+    isInHouseProduction: Boolean(inHouseProductionInput?.checked),
     isRush: false
   };
 
@@ -2167,24 +2371,49 @@ async function submitEntry() {
     return;
   }
 
-  saveStatus.textContent = "Generating Internal Tree Number...";
-  const generatedTree = generateInternalTreeNumber();
+  if (!entry.date) {
+    saveStatus.textContent = "Enter date to generate barcode";
+    formFields.date.focus();
+    return;
+  }
+
+  saveStatus.textContent = "Generating barcode...";
+  const generatedTree = generateUniqueBarcodeFields(entry);
+
+  if (!generatedTree) {
+    saveStatus.textContent = "Duplicate barcode value detected";
+    return;
+  }
 
   const savedEntry = normalizeEntry({
     ...entry,
     ...generatedTree
   });
+
+  if (!savedEntry.barcodeValue || hasDuplicateBarcodeValue(savedEntry.barcodeValue, savedEntry.id)) {
+    saveStatus.textContent = "Duplicate barcode value detected";
+    return;
+  }
+
   state.entries.unshift(savedEntry);
   editingEntryId = null;
   clearEntryForm();
   render();
-  scheduleSave(`Submitted ${savedEntry.internalTreeNumber}`);
+  scheduleSave(`Submitted ${savedEntry.barcodeValue}`);
   recordAudit("Internal Tree Number Generated", {
+    barcodeValue: savedEntry.barcodeValue,
+    isInHouseProduction: savedEntry.isInHouseProduction,
     module: "Wax Entries",
     internalTreeNumber: savedEntry.internalTreeNumber,
-    newValue: savedEntry.internalTreeNumber
+    newValue: {
+      barcodeValue: savedEntry.barcodeValue,
+      internalTreeNumber: savedEntry.internalTreeNumber,
+      isInHouseProduction: savedEntry.isInHouseProduction
+    }
   });
   recordAudit("Wax Entry created", {
+    barcodeValue: savedEntry.barcodeValue,
+    isInHouseProduction: savedEntry.isInHouseProduction,
     module: "Wax Entries",
     internalTreeNumber: savedEntry.internalTreeNumber,
     newValue: savedEntry
@@ -2195,6 +2424,9 @@ function clearEntryForm() {
   Object.values(formFields).forEach((field) => {
     field.value = "";
   });
+  if (inHouseProductionInput) {
+    inHouseProductionInput.checked = false;
+  }
   syncColorControl(formFields.metalKt, formFields.color);
   formFields.vendorCustomerName.focus();
 }
@@ -2219,6 +2451,8 @@ function deleteRow(entryId) {
   scheduleSave("Deleted");
   if (deletedEntry) {
     recordAudit("Wax Entry deleted", {
+      barcodeValue: getBarcodeValue(deletedEntry),
+      isInHouseProduction: Boolean(deletedEntry.isInHouseProduction),
       module: "Wax Entries",
       internalTreeNumber: getInternalTreeNumber(deletedEntry),
       oldValue: deletedEntry
@@ -2245,6 +2479,8 @@ function toggleRush(entryId) {
   render();
   scheduleSave(isRush ? "Rush enabled" : "Rush removed");
   recordAudit(isRush ? "Rush marked" : "Rush removed", {
+    barcodeValue: getBarcodeValue(targetEntry),
+    isInHouseProduction: Boolean(targetEntry.isInHouseProduction),
     module: "Wax Entries",
     internalTreeNumber: getInternalTreeNumber(targetEntry),
     oldValue: { isRush: targetEntry.isRush },
@@ -2297,10 +2533,17 @@ function saveEditedRow(entryId, row) {
   const entryIndex = state.entries.findIndex((entry) => entry.id === entryId);
   if (entryIndex === -1) return;
   const previousEntry = { ...state.entries[entryIndex] };
+  const preservedBarcodeValue = getBarcodeValue(previousEntry);
 
   const updatedEntry = {
     id: entryId,
     internalTreeNumber: state.entries[entryIndex].internalTreeNumber,
+    barcodeValue:
+      preservedBarcodeValue ||
+      buildBarcodeValue(
+        row.querySelector('[data-edit-field="date"]').value,
+        state.entries[entryIndex].internalTreeNumber
+      ),
     vendorCustomerName: row.querySelector('[data-edit-field="vendorCustomerName"]').value.trim(),
     date: row.querySelector('[data-edit-field="date"]').value,
     waxInvoiceNo: row.querySelector('[data-edit-field="waxInvoiceNo"]').value.trim(),
@@ -2311,6 +2554,7 @@ function saveEditedRow(entryId, row) {
       row.querySelector('[data-edit-field="metalKt"]').value,
       row.querySelector('[data-edit-field="color"]').value
     ),
+    isInHouseProduction: Boolean(state.entries[entryIndex].isInHouseProduction),
     isRush: Boolean(state.entries[entryIndex].isRush)
   };
 
@@ -2319,11 +2563,18 @@ function saveEditedRow(entryId, row) {
     return;
   }
 
+  if (updatedEntry.barcodeValue && hasDuplicateBarcodeValue(updatedEntry.barcodeValue, entryId)) {
+    saveStatus.textContent = "Duplicate barcode value detected";
+    return;
+  }
+
   state.entries[entryIndex] = updatedEntry;
   editingEntryId = null;
   render();
   scheduleSave("Updated");
   recordAudit("Wax Entry edited", {
+    barcodeValue: getBarcodeValue(updatedEntry),
+    isInHouseProduction: Boolean(updatedEntry.isInHouseProduction),
     module: "Wax Entries",
     internalTreeNumber: getInternalTreeNumber(updatedEntry),
     oldValue: previousEntry,
@@ -2345,7 +2596,9 @@ function exportCsv() {
     "Metal KT",
     "Color",
     "Wax Weight",
-    "Internal Tree Number"
+    "Internal Tree Number",
+    "In-House Production",
+    "Barcode Value"
   ];
   const rows = state.entries.map((entry) => [
     entry.vendorCustomerName,
@@ -2355,7 +2608,9 @@ function exportCsv() {
     entry.metalKt,
     entry.color,
     entry.waxWeight,
-    getInternalTreeNumber(entry)
+    getInternalTreeNumber(entry),
+    entry.isInHouseProduction ? "Yes" : "No",
+    getBarcodeValue(entry)
   ]);
   const csv = [header, ...rows].map((row) => row.map(escapeCsvCell).join(",")).join("\n");
   const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
@@ -2391,39 +2646,44 @@ function printEntryLabel(entryId) {
   saveStatus.textContent = "Preparing label...";
 
   requestAnimationFrame(() => {
-    waitForBarcodeFont(labelData.barcodeText).finally(() => {
+    waitForBarcodeRender().finally(() => {
       saveStatus.textContent = "Print dialog opened";
       window.print();
       recordAudit("Print", {
+        barcodeValue: labelData.barcodeValue,
+        isInHouseProduction: labelData.isInHouseProduction,
         module: "Wax Entries",
         internalTreeNumber: getInternalTreeNumber(entry),
-        newValue: labelData.displayCode
+        newValue: {
+          barcodeValue: labelData.barcodeValue,
+          internalTreeNumber: labelData.internalTreeNumber,
+          isInHouseProduction: labelData.isInHouseProduction,
+          metalDisplay: labelData.metalDisplay,
+          waxWeight: labelData.waxWeight
+        }
       });
     });
   });
 }
 
 function buildLabelData(entry) {
-  const dateCode = getBarcodeDate(entry.date);
   const internalTreeNumber = getInternalTreeNumber(entry);
+  const barcodeValue = getBarcodeValue(entry);
 
-  if (!dateCode || !internalTreeNumber) {
-    return null;
-  }
-
-  const displayCode = `${dateCode}-${internalTreeNumber}`;
-  const barcodeValue = toCode39Value(displayCode);
-
-  if (!barcodeValue) {
+  if (!barcodeValue || !internalTreeNumber) {
     return null;
   }
 
   return {
-    barcodeText: `*${barcodeValue}*`,
-    dateDisplay: formatDate(entry.date),
-    displayCode,
+    barcodeSvg: renderCode128Svg(barcodeValue, "label-barcode-svg", 64),
+    barcodeValue,
+    customerVendorTreeNo: formatLabelText(entry.customerVendorTreeNo),
     internalTreeNumber,
-    fontSize: getBarcodeFontSize(barcodeValue.length)
+    inHouseProductionDisplay: entry.isInHouseProduction ? "Yes" : "No",
+    isInHouseProduction: Boolean(entry.isInHouseProduction),
+    metalDisplay: formatEntryMetal(entry),
+    vendorInvoiceDisplay: formatVendorInvoiceDisplay(entry),
+    waxWeight: formatLabelWaxWeight(entry.waxWeight)
   };
 }
 
@@ -2433,43 +2693,50 @@ function getBarcodeDate(date) {
   return `${year}${month}${day}`;
 }
 
-function toCode39Value(value) {
-  return String(value || "")
-    .toUpperCase()
-    .replace(/[^A-Z0-9 .\$\/+%\-]/g, "");
+function formatEntryMetal(entry) {
+  return [entry.metalKt, entry.color].map((value) => String(value || "").trim()).filter(Boolean).join(" ") || "Metal pending";
 }
 
-function getBarcodeFontSize(valueLength) {
-  if (valueLength > 22) return 34;
-  if (valueLength > 18) return 38;
-  if (valueLength > 14) return 44;
-  return 52;
+function formatLabelText(value, fallback = "-") {
+  return String(value || "").trim() || fallback;
+}
+
+function formatVendorInvoiceDisplay(entry) {
+  return `${formatLabelText(entry.vendorCustomerName)} / ${formatLabelText(entry.waxInvoiceNo)}`;
+}
+
+function formatLabelWaxWeight(value) {
+  const waxWeight = String(value || "").trim();
+  return waxWeight ? `${waxWeight} g` : "Wax weight pending";
 }
 
 function renderPrintLabel(labelData) {
   return `
     <section class="print-label" aria-label="Barcode label">
-      <div class="label-code">${escapeHtml(labelData.displayCode)}</div>
-      <div class="label-barcode" style="--barcode-size: ${labelData.fontSize}pt">${escapeHtml(labelData.barcodeText)}</div>
+      <div class="label-barcode">${labelData.barcodeSvg}</div>
+      <div class="label-code">${escapeHtml(labelData.barcodeValue)}</div>
       <div class="label-details">
-        <span>${escapeHtml(labelData.dateDisplay)}</span>
-        <span>${escapeHtml(labelData.internalTreeNumber)}</span>
+        <span class="label-detail-label">Internal Tree Number:</span>
+        <span class="label-detail-value">${escapeHtml(labelData.internalTreeNumber)}</span>
+        <span class="label-detail-label">Customer / Vendor Tree No.:</span>
+        <span class="label-detail-value">${escapeHtml(labelData.customerVendorTreeNo)}</span>
+        <span class="label-detail-label">Vendor Name / Invoice No.:</span>
+        <span class="label-detail-value">${escapeHtml(labelData.vendorInvoiceDisplay)}</span>
+        <span class="label-detail-label">Metal KT and Color:</span>
+        <span class="label-detail-value">${escapeHtml(labelData.metalDisplay)}</span>
+        <span class="label-detail-label">Wax Weight:</span>
+        <span class="label-detail-value">${escapeHtml(labelData.waxWeight)}</span>
+        <span class="label-detail-label">In-House Production:</span>
+        <span class="label-detail-value">${escapeHtml(labelData.inHouseProductionDisplay)}</span>
       </div>
     </section>
   `;
 }
 
-function waitForBarcodeFont(sampleText) {
-  if (!document.fonts || typeof document.fonts.load !== "function") {
-    return Promise.resolve();
-  }
-
-  const fontLoad = document.fonts.load('48pt "Libre Barcode 39"', sampleText).then(() => document.fonts.ready);
-  const timeout = new Promise((resolve) => {
-    window.setTimeout(resolve, 2500);
+function waitForBarcodeRender() {
+  return new Promise((resolve) => {
+    requestAnimationFrame(() => requestAnimationFrame(resolve));
   });
-
-  return Promise.race([fontLoad, timeout]);
 }
 
 function getTodayDateValue() {
@@ -2764,6 +3031,7 @@ if (inventoryRoot) {
   inventoryRoot.addEventListener("click", (event) => {
     if (event.target.closest("[data-clear-inventory-filters]")) {
       inventoryFilters = {
+        barcodeValue: "",
         dateFrom: "",
         dateTo: "",
         internalTreeNumber: "",
@@ -2835,6 +3103,7 @@ if (auditLogsRoot) {
     if (event.target.closest("[data-clear-audit-filters]")) {
       auditFilters = {
         action: "",
+        barcodeValue: "",
         dateFrom: "",
         dateTo: "",
         internalTreeNumber: "",
@@ -2927,7 +3196,7 @@ window.addEventListener(kanbanWorkflowChangedEvent, () => {
 });
 
 window.addEventListener("storage", (event) => {
-  if (false && event.key === "kanban-legacy-removed") { // storage event removed — API-backed
+  if (event.key === kanbanStorageKey) {
     renderRows();
   }
 });
@@ -2942,6 +3211,13 @@ window.ProductionAuthComponents = {
   auditLogger,
   permissionUtils,
   useAuth
+};
+
+window.ProductionBarcode = {
+  getBarcodeValue,
+  normalizeBarcodeSearch,
+  normalizeBarcodeValue,
+  renderCode128Svg
 };
 
 populateDropdowns();

@@ -2,7 +2,8 @@
   "use strict";
 
   const RBAC = window.ProductionRBAC;
-  // API-backed — no localStorage for business data
+  const receivingStorageKey = "production-management-metal-receiving-v1";
+  const ledgerStorageKey = "production-management-inventory-ledger-v1";
   const receivingChangedEvent = "productionMetalReceivingChanged";
   const ledgerChangedEvent = "productionInventoryLedgerChanged";
 
@@ -164,6 +165,8 @@
     if (order.inventoryPosted) {
       recordAudit("Attempted duplicate inventory posting", {
         user: options.user,
+        barcodeValue: order.barcodeValue || order.barcodeDisplay || "",
+        isInHouseProduction: Boolean(order.isInHouseProduction),
         module: "Inventory",
         stage: "Order Completed",
         internalTreeNumber: order.orderCode,
@@ -175,6 +178,8 @@
     if (hasInventoryPostingForOrder(order.id)) {
       recordAudit("Attempted duplicate inventory posting", {
         user: options.user,
+        barcodeValue: order.barcodeValue || order.barcodeDisplay || "",
+        isInHouseProduction: Boolean(order.isInHouseProduction),
         module: "Inventory",
         stage: "Order Completed",
         internalTreeNumber: order.orderCode,
@@ -222,6 +227,7 @@
 
     const postedAt = options.postedAt || new Date().toISOString();
     const baseEntry = {
+      relatedBarcodeValue: order.barcodeValue || order.barcodeDisplay || "",
       relatedInternalTreeNumber: order.orderCode || "",
       relatedOrderId: order.id || "",
       sourceModule: "Order Completed",
@@ -292,6 +298,8 @@
 
     recordAudit("Final inventory posted", {
       user: options.user,
+      barcodeValue: order.barcodeValue || order.barcodeDisplay || "",
+      isInHouseProduction: Boolean(order.isInHouseProduction),
       module: "Inventory",
       stage: "Order Completed",
       internalTreeNumber: order.orderCode,
@@ -307,6 +315,8 @@
     });
     recordAudit("Order locked after inventory posting", {
       user: options.user,
+      barcodeValue: order.barcodeValue || order.barcodeDisplay || "",
+      isInHouseProduction: Boolean(order.isInHouseProduction),
       module: "Casting Process",
       stage: "Order Completed",
       internalTreeNumber: order.orderCode,
@@ -338,6 +348,7 @@
 
     recordAudit("Inventory ledger transaction created", {
       user: options.user,
+      barcodeValue: ledgerEntry.relatedBarcodeValue,
       module: "Inventory",
       internalTreeNumber: ledgerEntry.relatedInternalTreeNumber,
       newValue: ledgerEntry,
@@ -378,7 +389,7 @@
     return Array.from(balances.values()).sort((first, second) => first.label.localeCompare(second.label));
   }
 
-  async function hasInventoryPostingForOrder(orderId) {
+  function hasInventoryPostingForOrder(orderId) {
     if (!orderId) return false;
 
     return getInventoryLedger().some(
@@ -421,6 +432,7 @@
       notes: String(input.notes || "").trim(),
       outWeight: parseWeight(input.outWeight) || 0,
       purity,
+      relatedBarcodeValue: String(input.relatedBarcodeValue || "").trim(),
       relatedInternalTreeNumber: String(input.relatedInternalTreeNumber || "").trim(),
       relatedOrderId: String(input.relatedOrderId || "").trim(),
       sourceId: String(input.sourceId || "").trim(),
@@ -656,67 +668,42 @@
     };
   }
 
-  async function readReceivingState() {
-    try {
-      const API = window.CastingAPI;
-      if (!API) return { entries: [] };
-      const entries = await API.metalReceiving.list();
-      return { entries: entries.map(sanitizeReceivingEntry) };
-    } catch { return { entries: [] }; }
+  function readReceivingState() {
+    const storedState = readJson(receivingStorageKey);
+    return {
+      entries:
+        storedState && Array.isArray(storedState.entries)
+          ? storedState.entries.map(sanitizeReceivingEntry)
+          : []
+    };
   }
 
-  async function writeReceivingState(entry, isNew) {
-    const API = window.CastingAPI;
-    if (!API) return;
-    try {
-      if (isNew) {
-        await API.metalReceiving.create(entry);
-      } else if (entry.id) {
-        await API.metalReceiving.update(entry.id, entry);
-      }
-      window.dispatchEvent(new CustomEvent(receivingChangedEvent, { detail: {} }));
-    } catch (err) {
-      console.error("[inventory] writeReceivingState error:", err.message);
-      throw err;
-    }
+  function writeReceivingState(state) {
+    localStorage.setItem(receivingStorageKey, JSON.stringify({ entries: state.entries.map(sanitizeReceivingEntry) }));
+    window.dispatchEvent(new CustomEvent(receivingChangedEvent, { detail: { entries: getReceivingEntries() } }));
   }
 
-  async function readLedgerState() {
-    try {
-      const API = window.CastingAPI;
-      if (!API) return { entries: [] };
-      const entries = await API.inventoryLedger.list();
-      return { entries };
-    } catch { return { entries: [] }; }
+  function readLedgerState() {
+    const storedState = readJson(ledgerStorageKey);
+    return {
+      entries:
+        storedState && Array.isArray(storedState.entries)
+          ? storedState.entries.map((entry) => ({
+              ...normalizeLedgerEntry(entry, {
+                user: {
+                  id: entry.createdByUserId,
+                  username: entry.createdByUsername
+                }
+              }),
+              balanceAfterTransaction: roundWeight(Number.parseFloat(entry.balanceAfterTransaction) || 0)
+            }))
+          : []
+    };
   }
 
-  async function writeLedgerState(ledgerEntry, user) {
-    const API = window.CastingAPI;
-    if (!API) return;
-    try {
-      const posted = await API.inventoryLedger.post({
-        internalTreeNumber: ledgerEntry.internalTreeNumber || "",
-        entryType: ledgerEntry.entryType || "final_post",
-        metalKt: ledgerEntry.metalKt || "",
-        color: ledgerEntry.color || "",
-        metalSource: ledgerEntry.metalSource || "",
-        finishedWeight: ledgerEntry.finishedWeight ? String(ledgerEntry.finishedWeight) : undefined,
-        spruWeight: ledgerEntry.spruWeight ? String(ledgerEntry.spruWeight) : undefined,
-        scrapWeight: ledgerEntry.scrapWeight ? String(ledgerEntry.scrapWeight) : undefined,
-        fineGoldWeight: ledgerEntry.fineGoldWeight ? String(ledgerEntry.fineGoldWeight) : undefined,
-        alloyWeight: ledgerEntry.alloyWeight ? String(ledgerEntry.alloyWeight) : undefined,
-        recycledWeight: ledgerEntry.recycledWeight ? String(ledgerEntry.recycledWeight) : undefined,
-        issuedWeight: ledgerEntry.issuedWeight ? String(ledgerEntry.issuedWeight) : undefined,
-        returnedWeight: ledgerEntry.returnedWeight ? String(ledgerEntry.returnedWeight) : undefined,
-        notes: ledgerEntry.notes || "",
-        rawPayload: ledgerEntry,
-      });
-      window.dispatchEvent(new CustomEvent(ledgerChangedEvent, { detail: { entry: posted } }));
-      return posted;
-    } catch (err) {
-      console.error("[inventory] writeLedgerState error:", err.message);
-      throw err;
-    }
+  function writeLedgerState(state) {
+    localStorage.setItem(ledgerStorageKey, JSON.stringify({ entries: state.entries }));
+    window.dispatchEvent(new CustomEvent(ledgerChangedEvent, { detail: { entries: getInventoryLedger() } }));
   }
 
   function recordAudit(action, details = {}) {
@@ -729,7 +716,14 @@
     });
   }
 
-  // readJson removed — API-backed storage only
+  function readJson(key) {
+    try {
+      return JSON.parse(localStorage.getItem(key));
+    } catch {
+      localStorage.removeItem(key);
+      return null;
+    }
+  }
 
   function createId(prefix) {
     if (window.crypto && typeof window.crypto.randomUUID === "function") {

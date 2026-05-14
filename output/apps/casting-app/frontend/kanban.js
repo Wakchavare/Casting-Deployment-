@@ -16,7 +16,8 @@
   const h = window.React.createElement;
   const { useEffect, useMemo, useState } = window.React;
 
-  // API-backed — no localStorage for business data
+  const waxStorageKey = "production-management-state-v1";
+  const kanbanStorageKey = "production-management-kanban-v1";
   const kanbanWorkflowChangedEvent = "productionKanbanWorkflowChanged";
   const waxEntriesChangedEvent = "waxEntriesChanged";
   const RBAC = window.ProductionRBAC;
@@ -103,20 +104,14 @@
     return Array.from(arguments).filter(Boolean).join(" ");
   }
 
-  async function fetchEntryFeed() {
+  function readEntryFeed() {
     try {
-      const API = window.CastingAPI;
-      if (!API) return normalizeEntryFeed([]);
-      const entries = await API.waxEntries.list();
-      return normalizeEntryFeed(entries);
+      const storedState = JSON.parse(localStorage.getItem(waxStorageKey));
+      const storedEntries = storedState && Array.isArray(storedState.entries) ? storedState.entries : [];
+      return normalizeEntryFeed(storedEntries);
     } catch {
       return normalizeEntryFeed([]);
     }
-  }
-
-  function readEntryFeed() {
-    // Synchronous stub — returns empty; async fetchEntryFeed() used on mount
-    return normalizeEntryFeed([]);
   }
 
   function normalizeEntryFeed(entries) {
@@ -129,11 +124,13 @@
 
   function normalizeWaxEntry(entry) {
     const internalTreeNumber = getInternalTreeNumber(entry);
+    const barcodeValue = getBarcodeValue({ ...entry, internalTreeNumber });
     const treeParts = parseInternalTreeNumber(internalTreeNumber);
 
     return {
       id: entry.id || createId(),
       internalTreeNumber,
+      barcodeValue,
       vendorCustomerName: entry.vendorCustomerName || "",
       date: entry.date || "",
       waxInvoiceNo: entry.waxInvoiceNo || "",
@@ -143,13 +140,14 @@
       waxWeight: entry.waxWeight || "",
       alphabet: treeParts.prefix,
       number: treeParts.sequence,
+      isInHouseProduction: Boolean(entry.isInHouseProduction),
       isRush: Boolean(entry.isRush)
     };
   }
 
   function hasOrderData(entry) {
     return Object.entries(entry).some(
-      ([key, value]) => key !== "id" && key !== "isRush" && String(value || "").trim()
+      ([key, value]) => !["id", "isRush", "isInHouseProduction"].includes(key) && String(value || "").trim()
     );
   }
 
@@ -161,36 +159,27 @@
     return `kanban-order-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   }
 
-  async function fetchWorkflowState() {
-    try {
-      const API = window.CastingAPI;
-      if (!API) return {};
-      const workflows = await API.castingWorkflow.list();
-      // Convert array to map keyed by waxEntryId for compatibility
-      const byId = {};
-      for (const wf of workflows) {
-        byId[wf.waxEntryId] = wf;
-      }
-      return byId;
-    } catch {
-      return {};
-    }
-  }
-
   function readWorkflowState() {
-    // Synchronous stub — async fetchWorkflowState() used on mount
+    try {
+      const storedState = JSON.parse(localStorage.getItem(kanbanStorageKey));
+      if (storedState && storedState.orders && typeof storedState.orders === "object") {
+        return storedState.orders;
+      }
+    } catch {
+      localStorage.removeItem(kanbanStorageKey);
+    }
+
     return {};
   }
 
-  async function persistWorkflowState(waxEntryId, workflowData) {
-    try {
-      const API = window.CastingAPI;
-      if (!API) return;
-      await API.castingWorkflow.update(waxEntryId, workflowData);
-      window.dispatchEvent(new CustomEvent(kanbanWorkflowChangedEvent, { detail: { waxEntryId, workflow: workflowData } }));
-    } catch (err) {
-      console.error("[kanban] Failed to persist workflow:", err.message);
-    }
+  function persistWorkflowState(workflowById) {
+    localStorage.setItem(
+      kanbanStorageKey,
+      JSON.stringify({
+        orders: workflowById
+      })
+    );
+    window.dispatchEvent(new CustomEvent(kanbanWorkflowChangedEvent, { detail: { orders: workflowById } }));
   }
 
   function getValidStage(stage) {
@@ -292,6 +281,8 @@
       scrapLossWeight: hasSubmittedWeightValue(workflow.scrapLossWeight) ? workflow.scrapLossWeight : "",
       damagedTree: workflow.damagedTree || null,
       finalStatus: workflow.finalStatus || "",
+      returnHistory: Array.isArray(workflow.returnHistory) ? workflow.returnHistory : [],
+      isInHouseProduction: Boolean(entry.isInHouseProduction),
       isRush: Boolean(entry.isRush),
       isDamaged,
       removedFromBoard,
@@ -314,6 +305,7 @@
       totalIssuedWeight,
       updatedAt: workflow.updatedAt || "",
       orderCode: formatOrderCode(entry),
+      barcodeValue: getBarcodeValue(entry),
       barcodeDisplay: buildBarcodeDisplay(entry),
       barcodeSearchKey: buildBarcodeSearchKey(entry),
       metalDisplay: formatMetal({ ...entry, color: currentColor }),
@@ -328,14 +320,7 @@
   }
 
   function buildBarcodeDisplay(order) {
-    const dateCode = getBarcodeDate(order.date);
-    const internalTreeNumber = getInternalTreeNumber(order);
-
-    if (!dateCode || !internalTreeNumber) {
-      return "";
-    }
-
-    return toCode39Value(`${dateCode}-${internalTreeNumber}`);
+    return getBarcodeValue(order);
   }
 
   function getInternalTreeNumber(entry = {}) {
@@ -360,7 +345,7 @@
   }
 
   function buildBarcodeSearchKey(order) {
-    return normalizeBarcodeSearch(buildBarcodeDisplay(order));
+    return normalizeBarcodeSearch(getBarcodeValue(order));
   }
 
   function getBarcodeDate(date) {
@@ -369,14 +354,29 @@
     return `${year}${month}${day}`;
   }
 
-  function toCode39Value(value) {
+  function buildBarcodeValue(date, internalTreeNumber) {
+    const dateCode = getBarcodeDate(date);
+    const treeNumber = String(internalTreeNumber || "").trim().toUpperCase();
+    return dateCode && treeNumber ? normalizeBarcodeValue(`${dateCode}-${treeNumber}`) : "";
+  }
+
+  function getBarcodeValue(entry = {}) {
+    const existingValue = normalizeBarcodeValue(entry.barcodeValue);
+    if (existingValue) return existingValue;
+
+    return buildBarcodeValue(entry.date, getInternalTreeNumber(entry));
+  }
+
+  function normalizeBarcodeValue(value) {
     return String(value || "")
+      .trim()
       .toUpperCase()
-      .replace(/[^A-Z0-9 .\$\/+%\-]/g, "");
+      .replace(/\s+/g, "")
+      .replace(/[^A-Z0-9-]/g, "");
   }
 
   function normalizeBarcodeSearch(value) {
-    return toCode39Value(String(value || "").trim().replace(/^\*+|\*+$/g, "")).replace(/[^A-Z0-9]/g, "");
+    return normalizeBarcodeValue(value).replace(/[^A-Z0-9]/g, "");
   }
 
   function formatMetal(order) {
@@ -640,9 +640,11 @@
         const damagedTree = order.damagedTree || {};
 
         return {
+          barcodeValue: order.barcodeValue,
           id: order.id,
           currentStage: order.finalStatus || order.stage,
           damageReason: damagedTree.damageReason || order.castingIssue?.damageReason || "",
+          isInHouseProduction: Boolean(order.isInHouseProduction),
           markedAt: damagedTree.markedAt || order.castingIssue?.submittedAt || "",
           metalDisplay: order.metalDisplay,
           notes: order.notes || "",
@@ -764,6 +766,8 @@
       item.metalDisplay,
       item.notes,
       item.orderCode,
+      item.barcodeValue,
+      item.isInHouseProduction ? "in-house prod" : "",
       item.reference,
       item.reportedStage,
       getStageDisplayName(item.reportedStage),
@@ -777,15 +781,22 @@
     return haystack.includes(query);
   }
 
+  function matchesInternalTreeNumberSearch(order, query) {
+    const searchValue = String(query || "").trim().toLowerCase();
+    if (!searchValue) return true;
+
+    return String(order.internalTreeNumber || "").trim().toLowerCase().includes(searchValue);
+  }
+
   function KanbanBoard() {
-    const [entryFeed, setEntryFeed] = useState(() => normalizeEntryFeed([]));
-    const [workflowById, setWorkflowById] = useState(() => ({}));
-    const [isLoading, setIsLoading] = useState(true);
+    const [entryFeed, setEntryFeed] = useState(readEntryFeed);
+    const [workflowById, setWorkflowById] = useState(readWorkflowState);
     const [selectedOrderId, setSelectedOrderId] = useState(null);
     const [draftNotes, setDraftNotes] = useState("");
     const [error, setError] = useState("");
     const [showDamagedTrees, setShowDamagedTrees] = useState(false);
     const [damagedTreeSearch, setDamagedTreeSearch] = useState("");
+    const [kanbanSearchValue, setKanbanSearchValue] = useState("");
     const [rbacVersion, setRbacVersion] = useState(0);
     const [scanValues, setScanValues] = useState(() => Object.fromEntries(stages.map((stage) => [stage, ""])));
     const [scanMessages, setScanMessages] = useState({});
@@ -796,7 +807,13 @@
     );
 
     const boardOrders = useMemo(() => orders.filter((order) => !order.removedFromBoard), [orders]);
-    const ordersByStage = useMemo(() => groupOrdersByStage(boardOrders), [boardOrders]);
+    const kanbanSearchQuery = kanbanSearchValue.trim().toLowerCase();
+    const isKanbanSearchActive = Boolean(kanbanSearchQuery);
+    const filteredBoardOrders = useMemo(
+      () => boardOrders.filter((order) => matchesInternalTreeNumberSearch(order, kanbanSearchQuery)),
+      [boardOrders, kanbanSearchQuery]
+    );
+    const ordersByStage = useMemo(() => groupOrdersByStage(filteredBoardOrders), [filteredBoardOrders]);
     const accessibleStages = useMemo(() => stages.filter((stage) => canUseStage(stage)), [rbacVersion]);
     const damagedTrees = useMemo(
       () => buildDamagedTrees(orders).filter((item) => canUseStage(item.reportedStage) || canUseStage(item.currentStage)),
@@ -806,42 +823,45 @@
       () => damagedTrees.filter((item) => matchesDamagedTreeSearch(item, damagedTreeSearch.trim().toLowerCase())),
       [damagedTrees, damagedTreeSearch]
     );
-    const selectedBoardOrder = boardOrders.find((order) => order.id === selectedOrderId) || null;
+    const selectedBoardOrder = filteredBoardOrders.find((order) => order.id === selectedOrderId) || null;
     const selectedOrder =
       selectedBoardOrder && canUseStage(selectedBoardOrder.stage) ? selectedBoardOrder : null;
+    const isFocusedView = Boolean(selectedOrder) && !isKanbanSearchActive;
     const activeStage = selectedOrder ? selectedOrder.stage : "";
-    const visibleStages = selectedOrder ? [selectedOrder.stage] : accessibleStages;
+    const visibleStages = isFocusedView ? [selectedOrder.stage] : accessibleStages;
     const canViewCastingProcess = canUseCastingProcess();
     const canViewDamagedTrees = stages.some((stage) => canUseStage(stage, "viewDamagedTrees"));
     const hasWaxEntries = entryFeed.entries.length > 0;
 
     useEffect(() => {
-      // Initial API load
-      async function loadFromAPI() {
-        setIsLoading(true);
-        try {
-          const [feed, workflows] = await Promise.all([fetchEntryFeed(), fetchWorkflowState()]);
-          setEntryFeed(feed);
-          setWorkflowById(workflows);
-        } finally {
-          setIsLoading(false);
+      function syncFromStorage() {
+        setEntryFeed(readEntryFeed());
+      }
+
+      function handleWaxEntriesChanged(event) {
+        const entries =
+          event.detail && Array.isArray(event.detail.entries) ? event.detail.entries : readEntryFeed().entries;
+        setEntryFeed(normalizeEntryFeed(entries));
+      }
+
+      function handleStorage(event) {
+        if (event.key === waxStorageKey) {
+          syncFromStorage();
+        }
+
+        if (event.key === kanbanStorageKey) {
+          setWorkflowById(readWorkflowState());
         }
       }
 
-      loadFromAPI();
-
-      // Re-fetch when wax entries change (e.g. new entry created)
-      function handleWaxEntriesChanged() {
-        fetchEntryFeed().then(setEntryFeed);
-        fetchWorkflowState().then(setWorkflowById);
-      }
-
       window.addEventListener(waxEntriesChangedEvent, handleWaxEntriesChanged);
-      window.addEventListener("focus", handleWaxEntriesChanged);
+      window.addEventListener("storage", handleStorage);
+      window.addEventListener("focus", syncFromStorage);
 
       return () => {
         window.removeEventListener(waxEntriesChangedEvent, handleWaxEntriesChanged);
-        window.removeEventListener("focus", handleWaxEntriesChanged);
+        window.removeEventListener("storage", handleStorage);
+        window.removeEventListener("focus", syncFromStorage);
       };
     }, []);
 
@@ -873,23 +893,26 @@
       };
     }, []);
 
-    // Workflow persistence is now handled per-mutation via persistWorkflowState(id, data)
-    // No auto-save effect needed — API calls happen inside setWorkflowById updaters
+    useEffect(() => {
+      persistWorkflowState(workflowById);
+    }, [workflowById]);
 
     useEffect(() => {
       if (
         selectedOrderId &&
-        !boardOrders.some((order) => order.id === selectedOrderId && canUseStage(order.stage))
+        !filteredBoardOrders.some((order) => order.id === selectedOrderId && canUseStage(order.stage))
       ) {
         setSelectedOrderId(null);
         setDraftNotes("");
         setError("");
       }
-    }, [boardOrders, rbacVersion, selectedOrderId]);
+    }, [filteredBoardOrders, rbacVersion, selectedOrderId]);
 
     function openOrder(order) {
       if (!canUseStage(order.stage, "open")) {
         recordAudit("Unauthorized access attempt", {
+          barcodeValue: order.barcodeValue,
+          isInHouseProduction: order.isInHouseProduction,
           module: "Casting Process",
           stage: getStageDisplayName(order.stage),
           internalTreeNumber: order.orderCode,
@@ -962,7 +985,7 @@
       const matchedOrder = orders.find((order) => order.barcodeSearchKey === barcodeSearchKey);
 
       if (!matchedOrder) {
-        setScanMessage(stage, "error", "No matching order found.");
+        setScanMessage(stage, "error", "No matching order found");
         return;
       }
 
@@ -981,6 +1004,8 @@
           [stage]: ""
         }));
         recordAudit("Unauthorized access attempt", {
+          barcodeValue: matchedOrder.barcodeValue,
+          isInHouseProduction: matchedOrder.isInHouseProduction,
           module: "Casting Process",
           stage: getStageDisplayName(matchedOrder.stage),
           internalTreeNumber: matchedOrder.orderCode,
@@ -999,8 +1024,8 @@
         matchedOrder.stage,
         matchedOrder.stage === stage ? "success" : "warning",
         matchedOrder.stage === stage
-          ? `Order opened in ${getStageDisplayName(stage)}.`
-          : `Order found in ${getStageDisplayName(matchedOrder.stage)}.`
+          ? `Order opened in ${getStageDisplayName(stage)}`
+          : `Order found in ${getStageDisplayName(matchedOrder.stage)}`
       );
     }
 
@@ -1035,6 +1060,8 @@
 
       if (submittedInventoryPosting && selectedOrder.inventoryPosted) {
         recordAudit("Attempted duplicate inventory posting", {
+          barcodeValue: selectedOrder.barcodeValue,
+          isInHouseProduction: selectedOrder.isInHouseProduction,
           module: "Inventory",
           stage: getStageDisplayName(selectedOrder.stage),
           internalTreeNumber: selectedOrder.orderCode,
@@ -1046,6 +1073,8 @@
 
       if (submittedInventoryPosting && !canPostFinalInventory()) {
         recordAudit("Unauthorized access attempt", {
+          barcodeValue: selectedOrder.barcodeValue,
+          isInHouseProduction: selectedOrder.isInHouseProduction,
           module: "Inventory",
           stage: getStageDisplayName(selectedOrder.stage),
           internalTreeNumber: selectedOrder.orderCode,
@@ -1057,6 +1086,8 @@
 
       if (!canUseStage(selectedOrder.stage, "submitStage")) {
         recordAudit("Unauthorized access attempt", {
+          barcodeValue: selectedOrder.barcodeValue,
+          isInHouseProduction: selectedOrder.isInHouseProduction,
           module: "Casting Process",
           stage: getStageDisplayName(selectedOrder.stage),
           internalTreeNumber: selectedOrder.orderCode,
@@ -1070,6 +1101,8 @@
       const submittedCastingIssue = details.castingIssue || selectedOrder.castingIssue || {};
       if (details.castingIssue?.damaged && !canUseStage(selectedOrder.stage, "markDamaged")) {
         recordAudit("Unauthorized access attempt", {
+          barcodeValue: selectedOrder.barcodeValue,
+          isInHouseProduction: selectedOrder.isInHouseProduction,
           module: "Casting Process",
           stage: getStageDisplayName(selectedOrder.stage),
           internalTreeNumber: selectedOrder.orderCode,
@@ -1119,9 +1152,10 @@
 
       setWorkflowById((currentState) => {
         const existingWorkflow = currentState[selectedOrder.id] || {};
-        const waxEntryId = selectedOrder.id;
 
-        const nextWorkflow = {
+        return {
+          ...currentState,
+          [selectedOrder.id]: {
             ...existingWorkflow,
             stage: shouldFinalizeDamagedTree ? selectedOrder.stage : nextStage,
             notes: notesValue.trim(),
@@ -1205,14 +1239,7 @@
                 }
               : {}),
             updatedAt: submittedAt
-          };
-
-        // Persist to backend API (fire-and-forget, optimistic update)
-        persistWorkflowState(waxEntryId, nextWorkflow);
-
-        return {
-          ...currentState,
-          [waxEntryId]: nextWorkflow
+          }
         };
       });
 
@@ -1238,6 +1265,91 @@
       cancelOrder();
     }
 
+    function returnSelectedOrderToAwaitingMetal(reason) {
+      if (!selectedOrder) {
+        setError("Order is no longer available.");
+        return;
+      }
+
+      if (selectedOrder.stage !== stages[1]) {
+        setError("Only Ready for Casting orders can be returned to Awaiting Metal.");
+        return;
+      }
+
+      if (!canUseStage(selectedOrder.stage, "submitStage")) {
+        recordAudit("Unauthorized access attempt", {
+          barcodeValue: selectedOrder.barcodeValue,
+          isInHouseProduction: selectedOrder.isInHouseProduction,
+          module: "Casting Process",
+          stage: getStageDisplayName(selectedOrder.stage),
+          internalTreeNumber: selectedOrder.orderCode,
+          notes: "Return to Awaiting Metal"
+        });
+        setError(permissionDeniedMessage);
+        return;
+      }
+
+      const returnReason = String(reason || "").trim();
+      if (!returnReason) {
+        setError("Reason for return is required.");
+        return;
+      }
+
+      const previousStage = stages[1];
+      const newStage = stages[0];
+      const returnedAt = new Date().toISOString();
+      const returnEntry = {
+        id: createId(),
+        newStage,
+        previousStage,
+        reason: returnReason,
+        returnedAt,
+        userId: currentUser.id || "unknown",
+        username: currentUser.username || currentUser.name || "Unknown User"
+      };
+
+      setWorkflowById((currentState) => {
+        const existingWorkflow = currentState[selectedOrder.id] || {};
+
+        return {
+          ...currentState,
+          [selectedOrder.id]: {
+            ...existingWorkflow,
+            castingIssue: null,
+            damagedTree: null,
+            finalStatus: "",
+            isDamaged: false,
+            notes: "",
+            removedFromBoard: false,
+            returnHistory: [...(Array.isArray(existingWorkflow.returnHistory) ? existingWorkflow.returnHistory : []), returnEntry],
+            stage: newStage,
+            updatedAt: returnedAt
+          }
+        };
+      });
+
+      recordAudit("Returned to Awaiting Metal", {
+        barcodeValue: selectedOrder.barcodeValue,
+        isInHouseProduction: selectedOrder.isInHouseProduction,
+        internalTreeNumber: selectedOrder.orderCode,
+        module: "Casting Process",
+        notes: returnReason,
+        oldValue: {
+          stage: getStageDisplayName(previousStage)
+        },
+        newValue: {
+          newStage: getStageDisplayName(newStage),
+          previousStage: getStageDisplayName(previousStage),
+          reason: returnReason,
+          returnedAt
+        },
+        stage: getStageDisplayName(previousStage)
+      });
+
+      setDraftNotes("");
+      setError("");
+    }
+
     function recordOrderAuditEvents({
       details,
       nextStage,
@@ -1249,6 +1361,8 @@
       const stageLabel = getStageDisplayName(selectedOrder.stage);
       const nextStageLabel = getStageDisplayName(nextStage);
       const baseDetails = {
+        barcodeValue: selectedOrder.barcodeValue,
+        isInHouseProduction: selectedOrder.isInHouseProduction,
         internalTreeNumber: selectedOrder.orderCode,
         module: "Casting Process",
         notes: notesValue,
@@ -1354,14 +1468,47 @@
         ),
         h(
           "div",
-          { className: "flex flex-wrap gap-2" },
+          { className: "flex w-full flex-col gap-2 sm:w-auto sm:flex-row sm:flex-wrap sm:items-center sm:justify-end" },
+          !showDamagedTrees
+            ? h(
+                "div",
+                { className: "flex min-w-0 gap-2 sm:w-[300px]" },
+                h(
+                  "label",
+                  { className: "min-w-0 flex-1" },
+                  h("span", { className: "sr-only" }, "Search internal tree number"),
+                  h("input", {
+                    className:
+                      "min-h-9 w-full rounded-md border border-production-line bg-white px-3 text-xs font-bold text-production-ink outline-none transition placeholder:text-production-muted focus:border-production-teal focus:ring-4 focus:ring-teal-100",
+                    onChange: (event) => setKanbanSearchValue(event.target.value),
+                    placeholder: "Search internal tree number",
+                    type: "search",
+                    value: kanbanSearchValue
+                  })
+                ),
+                kanbanSearchValue
+                  ? h(
+                      "button",
+                      {
+                        className:
+                          "min-h-9 rounded-md border border-production-line bg-white px-3 text-xs font-bold text-production-muted hover:border-production-teal hover:text-production-teal",
+                        onClick: () => setKanbanSearchValue(""),
+                        type: "button"
+                      },
+                      "Clear"
+                    )
+                  : null
+              )
+            : null,
           h(
             "span",
             {
               className:
                 "rounded-full bg-production-soft px-3 py-2 text-xs font-bold text-production-teal"
             },
-            `${boardOrders.length} ${boardOrders.length === 1 ? "order" : "orders"}`
+            isKanbanSearchActive
+              ? `${filteredBoardOrders.length} of ${boardOrders.length} orders`
+              : `${boardOrders.length} ${boardOrders.length === 1 ? "order" : "orders"}`
           ),
           h(
             "button",
@@ -1387,54 +1534,69 @@
           })
         : h(
             "div",
-            { className: cx("kanban-board-scroll p-4", selectedOrder && "is-focused") },
+            { className: cx("kanban-board-scroll p-4", isFocusedView && "is-focused") },
             hasWaxEntries
               ? h(
-                  "div",
-                  { className: cx("kanban-board-track", selectedOrder && "is-focused") },
-                  visibleStages.length
-                    ? visibleStages.map((stage) =>
-                        h(
-                          window.React.Fragment,
-                          { key: stage },
-                          h(StageColumn, {
-                            activeOrderId: selectedOrderId,
-                            activeStage,
-                            hasSelection: Boolean(selectedOrder),
-                            onScanChange: updateScanValue,
-                            onScanSubmit: scanBarcode,
-                            onCloseOrder: cancelOrder,
-                            orders: ordersByStage[stage],
-                            onOpenOrder: openOrder,
-                            scanStatus: scanMessages[stage],
-                            scanValue: scanValues[stage] || "",
-                            stage
-                          }),
-                          selectedOrder && selectedOrder.stage === stage
-                            ? h(OrderDetailPanel, {
-                                key: `${selectedOrder.id}-detail`,
-                                draftNotes,
-                                error,
-                                onCancel: cancelOrder,
-                                onDraftNotesChange: setDraftNotes,
-                                onSubmit: submitOrder,
-                                order: selectedOrder,
-                                canEditStage: canUseStage(selectedOrder.stage, "edit"),
-                                canMarkDamaged: canUseStage(selectedOrder.stage, "markDamaged"),
-                                canPostFinalInventory: canPostFinalInventory(),
-                                canSubmitStage: canUseStage(selectedOrder.stage, "submitStage")
-                              })
-                            : null
-                        )
-                      )
-                    : h(
+                  window.React.Fragment,
+                  null,
+                  isKanbanSearchActive && !filteredBoardOrders.length
+                    ? h(
                         "div",
                         {
                           className:
-                            "w-full rounded-lg border border-dashed border-production-line bg-slate-50 p-8 text-center text-sm font-bold text-production-muted"
+                            "mb-4 rounded-lg border border-dashed border-production-line bg-slate-50 p-5 text-center text-sm font-bold text-production-muted"
                         },
-                        "No Casting Process stages are available for your roles."
+                        "No matching orders found."
                       )
+                    : null,
+                  h(
+                    "div",
+                    { className: cx("kanban-board-track", isFocusedView && "is-focused") },
+                    visibleStages.length
+                      ? visibleStages.map((stage) =>
+                          h(
+                            window.React.Fragment,
+                            { key: stage },
+                            h(StageColumn, {
+                              activeOrderId: selectedOrderId,
+                              activeStage,
+                              hasSelection: isFocusedView,
+                              onScanChange: updateScanValue,
+                              onScanSubmit: scanBarcode,
+                              onCloseOrder: cancelOrder,
+                              orders: ordersByStage[stage],
+                              onOpenOrder: openOrder,
+                              scanStatus: scanMessages[stage],
+                              scanValue: scanValues[stage] || "",
+                              stage
+                            }),
+                            isFocusedView && selectedOrder.stage === stage
+                              ? h(OrderDetailPanel, {
+                                  key: `${selectedOrder.id}-detail`,
+                                  draftNotes,
+                                  error,
+                                  onCancel: cancelOrder,
+                                  onDraftNotesChange: setDraftNotes,
+                                  onReturnToAwaitingMetal: returnSelectedOrderToAwaitingMetal,
+                                  onSubmit: submitOrder,
+                                  order: selectedOrder,
+                                  canEditStage: canUseStage(selectedOrder.stage, "edit"),
+                                  canMarkDamaged: canUseStage(selectedOrder.stage, "markDamaged"),
+                                  canPostFinalInventory: canPostFinalInventory(),
+                                  canSubmitStage: canUseStage(selectedOrder.stage, "submitStage")
+                                })
+                              : null
+                          )
+                        )
+                      : h(
+                          "div",
+                          {
+                            className:
+                              "w-full rounded-lg border border-dashed border-production-line bg-slate-50 p-8 text-center text-sm font-bold text-production-muted"
+                          },
+                          "No Casting Process stages are available for your roles."
+                        )
+                  )
                 )
               : h(
                   "div",
@@ -1591,6 +1753,19 @@
     return "border border-slate-200 bg-white text-production-muted";
   }
 
+  function InHouseProductionBadge({ isVisible }) {
+    return isVisible ? h("span", { className: "in-house-badge" }, "In-House Prod") : null;
+  }
+
+  function OrderCodeWithBadges({ className = "", orderCode, showInHouse }) {
+    return h(
+      "span",
+      { className: cx("inline-flex min-w-0 flex-wrap items-center gap-2", className) },
+      h("span", { className: "truncate" }, orderCode),
+      h(InHouseProductionBadge, { isVisible: showInHouse })
+    );
+  }
+
   function DamagedTreesView({ damagedTreeSearch, damagedTrees, filteredDamagedTrees, onClose, onSearchChange }) {
     const [expandedTreeId, setExpandedTreeId] = useState(null);
 
@@ -1707,7 +1882,11 @@
           },
           isExpanded ? "-" : "+"
         ),
-        h("span", { className: "truncate" }, item.orderCode),
+        h(OrderCodeWithBadges, {
+          className: "min-w-0",
+          orderCode: item.orderCode,
+          showInHouse: item.isInHouseProduction
+        }),
         h("span", { className: "truncate" }, item.metalDisplay),
         h("span", { className: "truncate", title: item.damageReason || "No reason entered" }, item.damageReason || "No reason entered"),
         h("span", { className: "truncate text-production-muted" }, formatDateTime(item.markedAt))
@@ -1724,7 +1903,14 @@
           ? h(
               "div",
               { className: "grid gap-3 p-4 text-sm md:grid-cols-2 xl:grid-cols-3" },
-              h(DetailFact, { label: "Internal Tree Number", value: item.orderCode }),
+              h(DetailFact, {
+                label: "Internal Tree Number",
+                value: h(OrderCodeWithBadges, {
+                  orderCode: item.orderCode,
+                  showInHouse: item.isInHouseProduction
+                })
+              }),
+              h(DetailFact, { label: "Barcode Value", value: item.barcodeValue || "Not available" }),
               h(DetailFact, { label: "Customer / Order Reference", value: item.reference }),
               h(DetailFact, { label: "Metal KT and Color", value: item.metalDisplay }),
               h(DetailFact, { label: "Wax Weight", value: item.weightDisplay }),
@@ -1769,6 +1955,7 @@
             "div",
             { className: "mt-1 flex flex-wrap items-center gap-2" },
             h("p", { className: "truncate text-lg font-bold text-production-ink" }, order.orderCode),
+            h(InHouseProductionBadge, { isVisible: order.isInHouseProduction }),
             order.isRush ? h("span", { className: "kanban-rush-badge" }, "Rush") : null
           ),
           h("p", { className: "kanban-card-secondary mt-1 text-xs font-bold text-production-muted" }, order.reference)
@@ -2030,7 +2217,10 @@
             "div",
             { className: "min-w-0" },
             h("p", { className: "text-xs font-bold uppercase text-production-teal" }, "Focused Order"),
-            h("h3", { className: "mt-2 truncate text-3xl font-bold text-production-ink" }, order.orderCode)
+            h("h3", { className: "mt-2 text-3xl font-bold text-production-ink" }, h(OrderCodeWithBadges, {
+              orderCode: order.orderCode,
+              showInHouse: order.isInHouseProduction
+            }))
           ),
           h(
             "button",
@@ -2235,6 +2425,7 @@
     draftNotes,
     onCancel,
     onDraftNotesChange,
+    onReturnToAwaitingMetal,
     onSubmit,
     order
   }) {
@@ -2247,6 +2438,9 @@
     });
     const [damaged, setDamaged] = useState(Boolean(savedCastingIssue.damaged));
     const [damageReason, setDamageReason] = useState(savedCastingIssue.damageReason || "");
+    const [showReturnModal, setShowReturnModal] = useState(false);
+    const [returnReason, setReturnReason] = useState("");
+    const [returnValidationMessage, setReturnValidationMessage] = useState("");
     const [validationMessage, setValidationMessage] = useState("");
 
     useEffect(() => {
@@ -2260,6 +2454,9 @@
       });
       setDamaged(Boolean(currentCastingIssue.damaged));
       setDamageReason(currentCastingIssue.damageReason || "");
+      setShowReturnModal(false);
+      setReturnReason("");
+      setReturnValidationMessage("");
       setValidationMessage("");
     }, [order.id, order.castingIssue]);
 
@@ -2315,6 +2512,35 @@
       });
     }
 
+    function openReturnModal() {
+      if (!canEditStage || !canSubmitStage) {
+        setValidationMessage(permissionDeniedMessage);
+        return;
+      }
+
+      setReturnReason("");
+      setReturnValidationMessage("");
+      setShowReturnModal(true);
+    }
+
+    function closeReturnModal() {
+      setShowReturnModal(false);
+      setReturnReason("");
+      setReturnValidationMessage("");
+    }
+
+    function confirmReturn() {
+      const trimmedReason = returnReason.trim();
+      if (!trimmedReason) {
+        setReturnValidationMessage("Reason for Return is required.");
+        return;
+      }
+
+      if (typeof onReturnToAwaitingMetal === "function") {
+        onReturnToAwaitingMetal(trimmedReason);
+      }
+    }
+
     return h(
       "aside",
       {
@@ -2328,7 +2554,10 @@
           "div",
           { className: "min-w-0" },
           h("p", { className: "text-xs font-bold uppercase text-production-teal" }, "Focused Order"),
-          h("h3", { className: "mt-2 truncate text-3xl font-bold text-production-ink" }, order.orderCode)
+          h("h3", { className: "mt-2 text-3xl font-bold text-production-ink" }, h(OrderCodeWithBadges, {
+            orderCode: order.orderCode,
+            showInHouse: order.isInHouseProduction
+          }))
         ),
         h(
           "button",
@@ -2343,8 +2572,15 @@
       ),
       h(
         "dl",
-        { className: "grid gap-4 text-sm md:grid-cols-2 xl:grid-cols-5" },
-        h(DetailFact, { label: "Internal Tree Number", value: order.orderCode }),
+        { className: "grid gap-4 text-sm md:grid-cols-2 xl:grid-cols-6" },
+        h(DetailFact, {
+          label: "Internal Tree Number",
+          value: h(OrderCodeWithBadges, {
+            orderCode: order.orderCode,
+            showInHouse: order.isInHouseProduction
+          })
+        }),
+        h(DetailFact, { label: "Barcode Value", value: order.barcodeValue || "Not available" }),
         h(DetailFact, { label: "Metal KT and Color", value: order.metalDisplay }),
         h(DetailFact, { label: "Wax Weight", value: order.weightDisplay }),
         h(DetailFact, { label: "Customer / Order Reference", value: order.reference }),
@@ -2472,35 +2708,153 @@
             checklistValidationMessage
           )
         : null,
+      showReturnModal
+        ? h(ReturnToAwaitingMetalModal, {
+            onCancel: closeReturnModal,
+            onConfirm: confirmReturn,
+            onReasonChange: (value) => {
+              setReturnReason(value);
+              setReturnValidationMessage("");
+            },
+            reason: returnReason,
+            validationMessage: returnValidationMessage
+          })
+        : null,
       h(
         "div",
-        { className: "mt-auto flex flex-col-reverse gap-3 border-t border-production-line pt-6 sm:flex-row sm:justify-end" },
+        {
+          className:
+            "mt-auto flex flex-col gap-3 border-t border-production-line pt-6 lg:flex-row lg:items-center lg:justify-between"
+        },
         h(
-          "button",
-          {
-            className:
-              "min-h-12 rounded-md border border-production-line bg-white px-6 font-bold text-production-muted hover:bg-slate-50",
-            onClick: onCancel,
-            type: "button"
-          },
-          "Cancel"
+          "div",
+          { className: "flex" },
+          h(
+            "button",
+            {
+              className: cx(
+                "min-h-12 rounded-md border px-5 font-bold",
+                canEditStage && canSubmitStage
+                  ? "border-amber-300 bg-amber-50 text-amber-800 hover:bg-amber-100"
+                  : "cursor-not-allowed border-slate-200 bg-slate-100 text-slate-400"
+              ),
+              disabled: !canEditStage || !canSubmitStage,
+              onClick: openReturnModal,
+              title:
+                canEditStage && canSubmitStage
+                  ? "Return order to Awaiting Metal"
+                  : "Submit stage permission required",
+              type: "button"
+            },
+            "Return to Awaiting Metal"
+          )
         ),
         h(
-          "button",
-          {
-            "aria-disabled": String(!allChecklistComplete || !canSubmitStage),
-            className: cx(
-              "min-h-12 rounded-md px-8 font-bold text-white",
-              allChecklistComplete && canEditStage && canSubmitStage
-                ? "bg-production-teal hover:bg-[#0c5853]"
-                : "cursor-not-allowed bg-slate-300 hover:bg-slate-300"
-            ),
-            disabled: !allChecklistComplete || !canEditStage || !canSubmitStage,
-            onClick: submitCasting,
-            title: canSubmitStage ? "Submit casting checklist" : "Submit stage permission required",
-            type: "button"
-          },
-          "Submit"
+          "div",
+          { className: "flex flex-col-reverse gap-3 sm:flex-row sm:justify-end" },
+          h(
+            "button",
+            {
+              className:
+                "min-h-12 rounded-md border border-production-line bg-white px-6 font-bold text-production-muted hover:bg-slate-50",
+              onClick: onCancel,
+              type: "button"
+            },
+            "Cancel"
+          ),
+          h(
+            "button",
+            {
+              "aria-disabled": String(!allChecklistComplete || !canSubmitStage),
+              className: cx(
+                "min-h-12 rounded-md px-8 font-bold text-white",
+                allChecklistComplete && canEditStage && canSubmitStage
+                  ? "bg-production-teal hover:bg-[#0c5853]"
+                  : "cursor-not-allowed bg-slate-300 hover:bg-slate-300"
+              ),
+              disabled: !allChecklistComplete || !canEditStage || !canSubmitStage,
+              onClick: submitCasting,
+              title: canSubmitStage ? "Submit casting checklist" : "Submit stage permission required",
+              type: "button"
+            },
+            "Submit"
+          )
+        )
+      )
+    );
+  }
+
+  function ReturnToAwaitingMetalModal({ onCancel, onConfirm, onReasonChange, reason, validationMessage }) {
+    const reasonValue = String(reason || "");
+    const isConfirmDisabled = !reasonValue.trim();
+
+    return h(
+      "div",
+      {
+        className: "fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 p-4",
+        role: "dialog",
+        "aria-modal": "true",
+        "aria-labelledby": "returnToAwaitingMetalTitle"
+      },
+      h(
+        "div",
+        { className: "w-full max-w-lg rounded-lg border border-amber-200 bg-white p-5 shadow-xl" },
+        h("h4", { className: "text-lg font-bold text-production-ink", id: "returnToAwaitingMetalTitle" }, "Return to Awaiting Metal"),
+        h(
+          "p",
+          { className: "mt-3 text-sm font-bold leading-6 text-production-muted" },
+          "This will move the order back to Awaiting Metal. Metal issue data will be preserved. Ready for Casting checklist data will be reset. Please provide a reason for return."
+        ),
+        h(
+          "label",
+          { className: "mt-4 block text-sm font-bold text-production-ink" },
+          "Reason for Return",
+          h("textarea", {
+            "aria-required": "true",
+            className:
+              "mt-2 min-h-28 w-full resize-y rounded-lg border border-amber-200 bg-white p-4 text-sm font-normal text-production-ink outline-none focus:border-amber-500 focus:ring-4 focus:ring-amber-100",
+            onChange: (event) => onReasonChange(event.target.value),
+            placeholder: "Enter why this order is returning to Awaiting Metal",
+            required: true,
+            value: reasonValue
+          })
+        ),
+        validationMessage
+          ? h(
+              "p",
+              { className: "mt-3 rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm font-bold text-red-700" },
+              validationMessage
+            )
+          : null,
+        h(
+          "div",
+          { className: "mt-5 flex flex-col-reverse gap-3 sm:flex-row sm:justify-end" },
+          h(
+            "button",
+            {
+              className:
+                "min-h-11 rounded-md border border-production-line bg-white px-5 font-bold text-production-muted hover:bg-slate-50",
+              onClick: onCancel,
+              type: "button"
+            },
+            "Cancel"
+          ),
+          h(
+            "button",
+            {
+              "aria-disabled": String(isConfirmDisabled),
+              className: cx(
+                "min-h-11 rounded-md px-5 font-bold text-white",
+                isConfirmDisabled
+                  ? "cursor-not-allowed bg-slate-300 hover:bg-slate-300"
+                  : "bg-amber-600 hover:bg-amber-700"
+              ),
+              disabled: isConfirmDisabled,
+              onClick: onConfirm,
+              type: "button"
+            },
+            "Confirm Return"
+          )
         )
       )
     );
@@ -2581,7 +2935,10 @@
           "div",
           { className: "min-w-0" },
           h("p", { className: "text-xs font-bold uppercase text-production-teal" }, "Focused Order"),
-          h("h3", { className: "mt-2 truncate text-3xl font-bold text-production-ink" }, order.orderCode)
+          h("h3", { className: "mt-2 text-3xl font-bold text-production-ink" }, h(OrderCodeWithBadges, {
+            orderCode: order.orderCode,
+            showInHouse: order.isInHouseProduction
+          }))
         ),
         h(
           "div",
@@ -2609,8 +2966,15 @@
       ),
       h(
         "dl",
-        { className: "grid gap-4 text-sm md:grid-cols-2 xl:grid-cols-5" },
-        h(DetailFact, { label: "Internal Tree Number", value: order.orderCode }),
+        { className: "grid gap-4 text-sm md:grid-cols-2 xl:grid-cols-6" },
+        h(DetailFact, {
+          label: "Internal Tree Number",
+          value: h(OrderCodeWithBadges, {
+            orderCode: order.orderCode,
+            showInHouse: order.isInHouseProduction
+          })
+        }),
+        h(DetailFact, { label: "Barcode Value", value: order.barcodeValue || "Not available" }),
         h(DetailFact, { label: "Metal KT and Color", value: order.metalDisplay }),
         h(DetailFact, { label: "Wax Weight", value: order.weightDisplay }),
         h(DetailFact, { label: "Customer / Order Reference", value: order.reference }),
@@ -2894,7 +3258,10 @@
           "div",
           { className: "min-w-0" },
           h("p", { className: "text-xs font-bold uppercase text-production-teal" }, "Focused Order"),
-          h("h3", { className: "mt-2 truncate text-3xl font-bold text-production-ink" }, order.orderCode)
+          h("h3", { className: "mt-2 text-3xl font-bold text-production-ink" }, h(OrderCodeWithBadges, {
+            orderCode: order.orderCode,
+            showInHouse: order.isInHouseProduction
+          }))
         ),
         h(
           "button",
@@ -2909,8 +3276,15 @@
       ),
       h(
         "dl",
-        { className: "grid gap-4 text-sm md:grid-cols-2 xl:grid-cols-5" },
-        h(DetailFact, { label: "Internal Tree Number", value: order.orderCode }),
+        { className: "grid gap-4 text-sm md:grid-cols-2 xl:grid-cols-6" },
+        h(DetailFact, {
+          label: "Internal Tree Number",
+          value: h(OrderCodeWithBadges, {
+            orderCode: order.orderCode,
+            showInHouse: order.isInHouseProduction
+          })
+        }),
+        h(DetailFact, { label: "Barcode Value", value: order.barcodeValue || "Not available" }),
         h(DetailFact, { label: "Metal KT and Color", value: order.metalDisplay }),
         h(DetailFact, { label: "Wax Weight", value: order.weightDisplay }),
         h(DetailFact, { label: "Customer / Order Reference", value: order.reference }),
@@ -3141,7 +3515,14 @@
     const [validationMessage, setValidationMessage] = useState("");
     const [showConfirmPost, setShowConfirmPost] = useState(false);
     const topFacts = [
-      { label: "Internal Tree Number", value: orderTitle },
+      {
+        label: "Internal Tree Number",
+        value: h(OrderCodeWithBadges, {
+          orderCode: orderTitle,
+          showInHouse: order.isInHouseProduction
+        })
+      },
+      { label: "Barcode Value", value: formatReviewInfoValue(order.barcodeValue) },
       { label: "Customer / Order Reference", value: formatReviewInfoValue(order.reference) },
       { label: "Wax Weight", value: formatReviewInfoValue(order.weightDisplay) },
       { label: "Metal KT and Color", value: formatReviewInfoValue(order.metalDisplay) },
@@ -3322,7 +3703,10 @@
           "div",
           { className: "min-w-0" },
           h("p", { className: "text-xs font-bold uppercase text-production-teal" }, "Focused Order"),
-          h("h3", { className: "mt-2 truncate text-3xl font-bold text-production-ink" }, orderTitle)
+          h("h3", { className: "mt-2 text-3xl font-bold text-production-ink" }, h(OrderCodeWithBadges, {
+            orderCode: orderTitle,
+            showInHouse: order.isInHouseProduction
+          }))
         ),
         h(
           "div",
@@ -3564,7 +3948,10 @@
           "div",
           { className: "min-w-0" },
           h("p", { className: "text-xs font-bold uppercase text-production-teal" }, "Focused Order"),
-          h("h3", { className: "mt-2 truncate text-3xl font-bold text-production-ink" }, order.orderCode)
+          h("h3", { className: "mt-2 text-3xl font-bold text-production-ink" }, h(OrderCodeWithBadges, {
+            orderCode: order.orderCode,
+            showInHouse: order.isInHouseProduction
+          }))
         ),
         h(
           "div",
@@ -3594,7 +3981,14 @@
       h(
         "dl",
         { className: "grid gap-4 text-sm md:grid-cols-2" },
-        h(DetailFact, { label: "Internal Tree Number", value: order.orderCode }),
+        h(DetailFact, {
+          label: "Internal Tree Number",
+          value: h(OrderCodeWithBadges, {
+            orderCode: order.orderCode,
+            showInHouse: order.isInHouseProduction
+          })
+        }),
+        h(DetailFact, { label: "Barcode Value", value: order.barcodeValue || "Not available" }),
         h(DetailFact, { label: "Metal KT and Color", value: order.metalDisplay }),
         h(DetailFact, { label: "Wax Weight", value: order.weightDisplay }),
         h(DetailFact, { label: "Customer / Order Reference", value: order.reference }),
