@@ -1,0 +1,114 @@
+version: "3.9"
+
+# ─── Networks ─────────────────────────────────────────────────────────────────
+networks:
+  casting_net:
+    driver: bridge
+  proxy_net:
+    driver: bridge
+
+# ─── Volumes ──────────────────────────────────────────────────────────────────
+volumes:
+  postgres_data:
+    driver: local
+  npm_data:
+    driver: local
+  npm_letsencrypt:
+    driver: local
+
+# ─── Services ─────────────────────────────────────────────────────────────────
+services:
+
+  # ── PostgreSQL ──────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: casting_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - casting_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    # PostgreSQL is NOT exposed to host — only reachable within casting_net
+
+  # ── Backend (NestJS) ────────────────────────────────────────────────────────
+  casting-backend:
+    build:
+      context: ./apps/casting-app/backend
+      dockerfile: Dockerfile
+    container_name: casting_backend
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_EXPIRES_IN: ${JWT_EXPIRES_IN:-15m}
+      REFRESH_TOKEN_DAYS: ${REFRESH_TOKEN_DAYS:-7}
+      CORS_ORIGIN: ${CORS_ORIGIN}
+      PORT: 3000
+      DEFAULT_ADMIN_EMAIL: ${DEFAULT_ADMIN_EMAIL}
+      DEFAULT_ADMIN_PASSWORD: ${DEFAULT_ADMIN_PASSWORD}
+    networks:
+      - casting_net
+      - proxy_net
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3000/api/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    # Backend NOT exposed to host — only accessible via nginx-proxy-manager
+
+  # ── Frontend (Nginx static) ─────────────────────────────────────────────────
+  casting-frontend:
+    build:
+      context: ./apps/casting-app/frontend
+      dockerfile: Dockerfile
+    container_name: casting_frontend
+    restart: unless-stopped
+    networks:
+      - proxy_net
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:80/ || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    # Frontend NOT exposed to host — only accessible via nginx-proxy-manager
+
+  # ── Nginx Proxy Manager ─────────────────────────────────────────────────────
+  nginx-proxy-manager:
+    image: jc21/nginx-proxy-manager:latest
+    container_name: casting_npm
+    restart: unless-stopped
+    ports:
+      - "80:80"     # HTTP (redirect to HTTPS)
+      - "443:443"   # HTTPS
+      - "81:81"     # NPM Admin UI
+    volumes:
+      - npm_data:/data
+      - npm_letsencrypt:/etc/letsencrypt
+    networks:
+      - proxy_net
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:81/ || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    depends_on:
+      - casting-frontend
+      - casting-backend
